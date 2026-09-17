@@ -49,14 +49,23 @@ jobs:
           # file larger than 100 MiB, so compact the tracked database first.
           npm run prune || echo "[prune] maintenance reported a problem; continuing"
 
-          DB_BYTES=$(stat -c%s kick_tracker.db 2>/dev/null || echo 0)
-          echo "[push] kick_tracker.db is $(( DB_BYTES / 1024 / 1024 )) MiB"
-          if [ "$DB_BYTES" -ge 104857600 ]; then
-            echo "Database exceeds GitHub's 100 MiB per-file push limit; aborting the push."
+          OVER_LIMIT=0
+          for DB_FILE in kick_tracker.db archive/*.db; do
+            [ -f "$DB_FILE" ] || continue
+            DB_BYTES=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+            echo "[push] $DB_FILE is $(( DB_BYTES / 1024 / 1024 )) MiB"
+            if [ "$DB_BYTES" -ge 104857600 ]; then
+              echo "Database $DB_FILE exceeds GitHub's 100 MiB per-file push limit; aborting the push."
+              OVER_LIMIT=1
+            fi
+          done
+          if [ "$OVER_LIMIT" = "1" ]; then
+            echo "Aborting the push."
             exit 1
           fi
 
           git add -f kick_tracker.db
+          git add -f archive/*.db 2>/dev/null || true
 
           if git diff --staged --quiet; then
             echo "No changes to push."

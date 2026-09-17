@@ -12,7 +12,6 @@
   <link rel="apple-touch-icon" href="favicon-180.png" sizes="180x180">
   <link rel="manifest" href="site.webmanifest">
 
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
   <style>
     :root { --bg: #07090e; --panel: #0f131c; --border: rgba(255,255,255,0.08); --green: #53fc18; --cyan: #00f0ff; --text: #f0f4f8; --muted: #8a99ad; }
     * { box-sizing: border-box; }
@@ -63,7 +62,7 @@
     <h1>Tracked Users</h1>
     <p class="intro">Every channel and chatter profile saved in the database, newest additions first.</p>
     <div class="toolbar"><input id="search" type="search" placeholder="Search users by username or tag..." autocomplete="off" /></div>
-    <div id="status" class="status">Loading database...</div>
+    <div id="status" class="status">Loading users...</div>
     <div id="count" class="count"></div>
     <div id="list" class="list"></div>
   </main>
@@ -72,6 +71,7 @@
     const PRIVACY_VERSION = '2026-09-12.3';
     const CONSENT_KEY = 'kickintel-consent';
     let users = [];
+    let totalUsers = 0;
 
     function hasConsent() {
       try {
@@ -99,19 +99,26 @@
     async function loadUsers() {
       const status = document.getElementById('status');
       try {
-        const SQL = await initSqlJs({ locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}` });
-        const response = await fetch('./kick_tracker.db', { cache: 'no-store' });
-        if (!response.ok) throw new Error('Database unavailable.');
-        const database = new SQL.Database(new Uint8Array(await response.arrayBuffer()));
-        const statement = database.prepare(`
-          SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated,
-                 (SELECT MIN(h.id) FROM username_history h WHERE h.channel_id = c.id) AS added_order
-          FROM channels c
-          ORDER BY added_order DESC, c.id DESC
-        `);
-        while (statement.step()) users.push(statement.getAsObject());
-        statement.free();
-        database.close();
+        // Fast path: the server-side API (token injected into this page).
+        const tokenMeta = document.querySelector('meta[name="api-token"]');
+        const response = await fetch('/v1/api/users/latest', {
+          cache: 'no-store',
+          headers: tokenMeta ? { 'X-API-Token': tokenMeta.content } : {}
+        });
+        if (!response.ok) {
+          if (response.status === 429) throw new Error('Resting time - too many requests. Try again shortly.');
+          if (response.status === 403) throw new Error('Session token expired - refresh the page to continue.');
+          throw new Error('API unavailable.');
+        }
+        const payload = await response.json();
+        users = (payload.users || []).map(row => ({
+          id: row.id,
+          current_slug: row.slug,
+          current_username: row.username,
+          followers_count: row.followers,
+          last_updated: row.last_updated
+        }));
+        totalUsers = payload.total || users.length;
         status.innerText = '';
         renderUsers();
       } catch (error) { status.innerText = error.message; }
@@ -121,10 +128,9 @@
     function renderUsers() {
       const query = document.getElementById('search').value.trim().toLowerCase();
       const matches = users.filter(user => `${user.current_username || ''} ${user.current_slug || ''}`.toLowerCase().includes(query));
-      const capped = matches.length > MAX_USERS_SHOWN;
-      document.getElementById('count').innerText = capped
-        ? `${matches.length.toLocaleString()} of ${users.length.toLocaleString()} users (showing first ${MAX_USERS_SHOWN})`
-        : `${matches.length.toLocaleString()} of ${users.length.toLocaleString()} users`;
+      document.getElementById('count').innerText = matches.length === users.length
+        ? `${matches.length.toLocaleString()} of ${totalUsers.toLocaleString()} users`
+        : `${matches.length.toLocaleString()} matching of ${totalUsers.toLocaleString()} users (page shows the ${users.length.toLocaleString()} newest)`;
       const list = document.getElementById('list');
       list.innerHTML = '';
       if (!matches.length) { list.innerHTML = '<div class="empty">No users match your search.</div>'; return; }

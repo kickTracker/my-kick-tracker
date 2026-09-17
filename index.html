@@ -16,8 +16,6 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
   
-      <script src="https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js"></script>
-
   <style>
     :root {
       --bg-dark: #07090e;
@@ -417,7 +415,7 @@
     const PRIVACY_VERSION = '2026-09-12.3';
         const CONSENT_STORAGE_KEY = 'kickintel-consent';
     let apiReady = false;
-    let db = null;
+    let homeStats = null;
     let currentFollowerRows = [];
     let currentUsernameRows = [];
     let currentSocialRows = [];
@@ -488,11 +486,10 @@
         async function initApi() {
       const statusEl = document.getElementById('status');
       try {
-        statusEl.innerText = "Loading database...";
-        const SQL = await initSqlJs({ locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}` });
-        const response = await fetch('./kick_tracker.db', { cache: 'no-store' });
-        if (!response.ok) throw new Error('Database unavailable.');
-        db = new SQL.Database(new Uint8Array(await response.arrayBuffer()));
+        statusEl.innerText = "Loading...";
+        const response = await fetch('/v1/api/stats', { cache: 'no-store' });
+        if (!response.ok) throw new Error('API unavailable.');
+        homeStats = await response.json();
         apiReady = true;
         statusEl.innerText = "Ready. Search any handle above.";
         loadHomeStats();
@@ -509,20 +506,11 @@
       return Number.isFinite(parsed) ? parsed : 0;
     }
 
-    function getTableCount(table) {
-      if (!db) return 0;
-      const stmt = db.prepare(`SELECT COUNT(*) AS n FROM ${table}`);
-      stmt.step();
-      const row = stmt.getAsObject();
-      stmt.free();
-      return Number(row.n) || 0;
-    }
-
     function loadHomeStats() {
-      if (!apiReady) return;
+      if (!apiReady || !homeStats) return;
       try {
-        document.getElementById('trackedChannelsCount').innerText = getTableCount('channels').toLocaleString();
-        document.getElementById('chatUsersCount').innerText = getTableCount('chat_users').toLocaleString();
+        document.getElementById('trackedChannelsCount').innerText = normalizeCount(homeStats.channels).toLocaleString();
+        document.getElementById('chatUsersCount').innerText = normalizeCount(homeStats.chat_users).toLocaleString();
       } catch (err) {
         console.error('[loadHomeStats]', err.message);
       }
@@ -1023,40 +1011,38 @@
       });
     }
 
-    function searchUser(explicitQuery, pushHistory = true) {
+    async function searchUser(explicitQuery, pushHistory = true) {
       const statusEl = document.getElementById('status');
       const cardEl = document.getElementById('resultCard');
       const featuredEl = document.getElementById('featuredSection');
       const inputEl = document.getElementById('searchInput');
       
       const queryHandle = (explicitQuery || inputEl.value).trim().toLowerCase();
-      if (!queryHandle || !db) return;
+      if (!queryHandle || !apiReady) return;
 
       if (pushHistory) {
         window.history.pushState({}, '', `?user=${encodeURIComponent(queryHandle)}`);
       }
 
       try {
-        const historyQuery = `
-          SELECT 
-            c.id AS channel_id, c.user_id, c.current_username, c.current_slug, 
-            c.followers_count, c.is_banned, c.verified, c.subscription_enabled, c.vod_enabled, c.livestream_title, c.bio,
-            c.instagram, c.twitter, c.youtube, c.discord, c.tiktok, c.facebook, c.profile_pic, c.raw_payload,
-            h.slug AS history_slug, h.username AS history_username, h.detected_at
-          FROM username_history h
-          JOIN channels c ON h.channel_id = c.id
-          WHERE LOWER(h.slug) = ? OR LOWER(h.username) = ? OR LOWER(c.current_slug) = ?
-          ORDER BY h.detected_at ASC
-        `;
+        // One fast server-side API call replaces the full-database download.
+        const response = await fetch(`/v1/api/user/${encodeURIComponent(queryHandle)}`, { cache: 'no-store' });
+        if (response.status === 404) {
+          statusEl.innerText = `No records found for handle: "${queryHandle}"`;
+          showToast('No records found for that handle.');
+          cardEl.classList.add('hidden');
+          featuredEl.classList.remove('hidden');
+          return;
+        }
+        if (response.status === 429) {
+          statusEl.innerText = 'Resting time - too many requests. Try again shortly.';
+          showToast('Resting time. Try again in a moment.');
+          return;
+        }
+        if (!response.ok) throw new Error('API unavailable.');
 
-        const stmt = db.prepare(historyQuery);
-        stmt.bind([queryHandle, queryHandle, queryHandle]);
-
-        const historyRows = [];
-        while (stmt.step()) historyRows.push(stmt.getAsObject());
-        stmt.free();
-
-        if (historyRows.length === 0) {
+        const channel = await response.json();
+        if (!channel || !channel.id) {
           statusEl.innerText = `No records found for handle: "${queryHandle}"`;
           showToast('No records found for that handle.');
           cardEl.classList.add('hidden');
@@ -1068,19 +1054,32 @@
         featuredEl.classList.add('hidden');
         cardEl.classList.remove('hidden');
 
-        const chStmt = db.prepare('SELECT * FROM channels WHERE id = ?');
-        chStmt.bind([historyRows[0].channel_id]);
-        const channel = chStmt.step() ? chStmt.getAsObject() : {};
-        chStmt.free();
-
-        if (!channel || !channel.id) {
-          statusEl.innerText = `No records found for handle: "${queryHandle}"`;
-          showToast('No records found for that handle.');
-          cardEl.classList.add('hidden');
-          featuredEl.classList.remove('hidden');
-          return;
-        }
         const channelId = channel.id;
+        // The UI renders username history as joined rows (channel + history entry).
+        const historyRows = (channel.username_history || []).map(entry => ({
+          channel_id: channel.id,
+          user_id: channel.user_id,
+          current_username: channel.current_username,
+          current_slug: channel.current_slug,
+          followers_count: channel.followers_count,
+          is_banned: channel.is_banned,
+          verified: channel.verified,
+          subscription_enabled: channel.subscription_enabled,
+          vod_enabled: channel.vod_enabled,
+          livestream_title: channel.livestream_title,
+          bio: channel.bio,
+          instagram: channel.instagram,
+          twitter: channel.twitter,
+          youtube: channel.youtube,
+          discord: channel.discord,
+          tiktok: channel.tiktok,
+          facebook: channel.facebook,
+          profile_pic: channel.profile_pic,
+          raw_payload: channel.raw_payload,
+          history_slug: entry.slug,
+          history_username: entry.username,
+          detected_at: entry.detected_at
+        }));
 
         let rawData = {};
         try {
@@ -1240,42 +1239,16 @@
         usernameVisibleCount = 10;
         renderUsernameHistory();
 
-        const socialStmt = db.prepare(`SELECT field_name, old_value, new_value, detected_at FROM socials_history WHERE channel_id = ? ORDER BY detected_at DESC`);
-        socialStmt.bind([channelId]);
-
-        const socialRows = [];
-        while (socialStmt.step()) socialRows.push(socialStmt.getAsObject());
-        socialStmt.free();
-
-        currentSocialRows = socialRows;
+        currentSocialRows = channel.socials_history || [];
         socialVisibleCount = 10;
         renderSocialHistory();
 
-        const chatStmt = db.prepare(`
-          SELECT m.chat_id, m.content, m.message_type, m.created_at, m.saved_at, m.raw_payload,
-                 m.sender_slug, m.sender_username,
-                 c.current_slug AS channel_slug
-          FROM chat_messages m
-          LEFT JOIN channels c ON c.id = m.chat_id
-          WHERE m.sender_user_id = ?
-          ORDER BY COALESCE(m.created_at, m.saved_at) DESC
-        `);
-        chatStmt.bind([channel.user_id || channel.channel_id]);
-        currentChatRows = [];
-        while (chatStmt.step()) currentChatRows.push(chatStmt.getAsObject());
-        chatStmt.free();
+        currentChatRows = channel.chat_messages || [];
         chatVisibleCount = 20;
         populateChatStreamFilter();
         renderChatHistory();
 
-        const followerHistoryQuery = `SELECT followers_count, recorded_at FROM follower_history WHERE channel_id = ? ORDER BY recorded_at ASC`;
-        const followerStmt = db.prepare(followerHistoryQuery);
-        followerStmt.bind([channelId]);
-
-        const followerRows = [];
-        while (followerStmt.step()) followerRows.push(followerStmt.getAsObject());
-        followerStmt.free();
-        currentFollowerRows = followerRows;
+        currentFollowerRows = channel.follower_history || [];
         renderFollowerHistoryChart(getFollowerRowsForRange());
 
       } catch (err) {

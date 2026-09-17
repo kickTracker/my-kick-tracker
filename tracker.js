@@ -150,6 +150,12 @@ async function initDb() {
       CREATE INDEX IF NOT EXISTS idx_chat_messages_saved_at ON chat_messages (saved_at)
     `);
 
+    // Profile lookups filter messages by sender; without this index every API
+    // user lookup was a full table scan over the whole message history.
+    await runQuery(`
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_sender ON chat_messages (sender_user_id)
+    `);
+
     await runQuery(`
       INSERT INTO follower_history (channel_id, followers_count, recorded_at)
       SELECT c.id, COALESCE(c.followers_count, 0), CURRENT_TIMESTAMP
@@ -610,22 +616,69 @@ function appendChatLog(tag, message) {
   rotateChatLogIfNeeded();
 }
 
+// --- Run summary (replaces per-channel log spam) ------------------------------
+// Every poll run appends ONE summary line instead of a line per channel:
+//   [summary] added 42 chatters in 1 poll and 318 messages (start -> finish UTC)
+// Counts also accumulate in .chat-tally.json (gitignored) so the GitHub Actions
+// worker can put the same summary into its commit messages until the next push.
+const CHAT_TALLY_PATH = './.chat-tally.json';
+
+function readChatTally() {
+  try {
+    const tally = JSON.parse(fs.readFileSync(CHAT_TALLY_PATH, 'utf8'));
+    if (tally && typeof tally === 'object') {
+      return {
+        start: tally.start || null,
+        finish: tally.finish || null,
+        polls: Number(tally.polls) || 0,
+        chatters: Number(tally.chatters) || 0,
+        messages: Number(tally.messages) || 0
+      };
+    }
+  } catch { /* fresh tally */ }
+  return { start: null, finish: null, polls: 0, chatters: 0, messages: 0 };
+}
+
+function writeChatTally(tally) {
+  try {
+    fs.writeFileSync(CHAT_TALLY_PATH, JSON.stringify(tally), 'utf8');
+  } catch (error) {
+    console.warn('[Chat] Could not persist run tally:', error.message);
+  }
+}
+
+// One summary line per poll run, and one rolling tally for the worker window.
+function recordRunSummary(runStats, runStartIso) {
+  const runFinishIso = new Date().toISOString();
+  appendChatLog(
+    'summary',
+    `added ${runStats.chatters} chatters in 1 poll and ${runStats.messages} messages ` +
+    `(${runStartIso} -> ${runFinishIso} UTC)`
+  );
+
+  const tally = readChatTally();
+  tally.start = tally.start || runStartIso;
+  tally.finish = runFinishIso;
+  tally.polls += 1;
+  tally.chatters += runStats.chatters;
+  tally.messages += runStats.messages;
+  writeChatTally(tally);
+}
+
 async function collectAndLogChat(data, fallbackTag) {
   const tag = data?.slug || fallbackTag || String(data?.id || 'unknown');
-  const displayTag = tag.charAt(0).toUpperCase() + tag.slice(1);
   const live = isLiveChannelPayload(data);
 
   if (!live) {
-    appendChatLog(displayTag, 'offline - messages added: 0, new users: 0');
     return { savedMessages: 0, discoveredUsers: 0 };
   }
 
   try {
     const result = await fetchLiveChatHistory(data);
-    appendChatLog(displayTag, `live - messages added: ${result.savedMessages}, new users: ${result.discoveredUsers}`);
+    // Per-channel lines removed on purpose: run summaries replace the spam.
     return result;
   } catch (error) {
-    appendChatLog(displayTag, `error - ${error.message}`);
+    appendChatLog(tag, `error - ${error.message}`);
     throw error;
   }
 }
@@ -754,10 +807,18 @@ async function refreshAllTrackedUsers() {
 const GITHUB_FILE_SIZE_LIMIT_BYTES = 100 * 1024 * 1024;
 const DATABASE_PATH = './kick_tracker.db';
 const MAINTENANCE_STATE_PATH = './.chat-maintenance.json';
-const CHAT_RETENTION_DAYS = Number.parseInt(process.env.CHAT_RETENTION_DAYS ?? '7', 10);
+const CHAT_RETENTION_DAYS = Number.parseFloat(process.env.CHAT_RETENTION_DAYS ?? '7');
+// `CHAT_RETENTION_DAYS=0` (or `unlimited`) disables age-based pruning entirely,
+// so chat history is kept forever; the size cap + archiving still apply.
+const CHAT_RETENTION_UNLIMITED = !Number.isFinite(CHAT_RETENTION_DAYS) || CHAT_RETENTION_DAYS <= 0;
 const CHAT_MAX_DB_BYTES = Math.max(1, Number.parseFloat(process.env.CHAT_MAX_DB_MB ?? '70')) * 1024 * 1024;
 const PAYLOAD_MIGRATION_INTERVAL_MS = 15 * 60 * 1000;
 const VACUUM_MIN_RECLAIM_BYTES = 4 * 1024 * 1024;
+// Shard archive: when the main DB grows past CHAT_MAX_DB_BYTES, oldest messages
+// are moved into archive/ shard files instead of being deleted. Each shard is
+// rolled over well below GitHub's 100 MiB per-file limit.
+const ARCHIVE_DIR = './archive';
+const ARCHIVE_SHARD_MAX_BYTES = 90 * 1024 * 1024;
 
 function getDatabaseSizeBytes() {
   try {
@@ -875,6 +936,139 @@ async function enforceChatSizeCap(maxBytes) {
   return deleted;
 }
 
+async function archiveOldestMessages(maxBytes) {
+  // Instead of deleting history when the tracked database grows past the cap,
+  // move the oldest chat messages into shard files (archive/kick_tracker-NNN.db).
+  // Each shard stays well below GitHub's 100 MiB per-file push limit, so the
+  // archive can grow essentially forever without ever blocking a push.
+  let archived = 0;
+  let size = getDatabaseSizeBytes();
+  if (size <= maxBytes) return 0;
+
+  fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+
+  const state = readMaintenanceState();
+  let shardName = typeof state.archiveShard === 'string' && /^kick_tracker-\d+\.db$/.test(state.archiveShard)
+    ? state.archiveShard
+    : null;
+
+  if (!shardName) {
+    const existing = fs.readdirSync(ARCHIVE_DIR)
+      .map(name => /^kick_tracker-(\d+)\.db$/.exec(name))
+      .filter(Boolean)
+      .map(match => Number(match[1]))
+      .sort((a, b) => b - a);
+    shardName = `kick_tracker-${String((existing[0] || 0) + 1).padStart(3, '0')}.db`;
+  }
+
+  // The path is generated locally and validated above, so it is safe to inline.
+  const shardPath = `${ARCHIVE_DIR}/${shardName}`;
+  const safePath = shardPath.replace(/'/g, "''");
+
+  await runQuery(`ATTACH DATABASE '${safePath}' AS archive_shard`);
+  try {
+    await runQuery(`
+      CREATE TABLE IF NOT EXISTS archive_shard.chat_messages (
+        message_id TEXT PRIMARY KEY,
+        chat_id INTEGER NOT NULL,
+        sender_user_id INTEGER,
+        sender_slug TEXT,
+        sender_username TEXT,
+        content TEXT,
+        message_type TEXT,
+        created_at TIMESTAMP,
+        raw_payload TEXT,
+        saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+    await runQuery(`
+      CREATE INDEX IF NOT EXISTS archive_shard.idx_chat_messages_sender
+      ON chat_messages (sender_user_id)
+    `);
+
+    for (let pass = 0; pass < 200 && size > maxBytes; pass += 1) {
+      const shardBytes = fs.existsSync(shardPath) ? fs.statSync(shardPath).size : 0;
+      if (shardBytes >= ARCHIVE_SHARD_MAX_BYTES) {
+        // This shard is full: roll over to the next numbered shard.
+        const existing = fs.readdirSync(ARCHIVE_DIR)
+          .map(name => /^kick_tracker-(\d+)\.db$/.exec(name))
+          .filter(Boolean)
+          .map(match => Number(match[1]))
+          .sort((a, b) => b - a);
+        shardName = `kick_tracker-${String((existing[0] || 0) + 1).padStart(3, '0')}.db`;
+        await runQuery(`DETACH DATABASE archive_shard`);
+        await runQuery(`ATTACH DATABASE '${`${ARCHIVE_DIR}/${shardName}`.replace(/'/g, "''")}' AS archive_shard`);
+        await runQuery(`
+          CREATE TABLE IF NOT EXISTS archive_shard.chat_messages (
+            message_id TEXT PRIMARY KEY,
+            chat_id INTEGER NOT NULL,
+            sender_user_id INTEGER,
+            sender_slug TEXT,
+            sender_username TEXT,
+            content TEXT,
+            message_type TEXT,
+            created_at TIMESTAMP,
+            raw_payload TEXT,
+            saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          )
+        `);
+        await runQuery(`
+          CREATE INDEX IF NOT EXISTS archive_shard.idx_chat_messages_sender
+          ON chat_messages (sender_user_id)
+        `);
+      }
+
+      const total = Number((await getQuery('SELECT COUNT(*) AS total FROM chat_messages'))?.total) || 0;
+      if (total === 0) break;
+
+      const bytesPerRow = Math.max(1, Math.floor(size / total));
+      const overBy = size - maxBytes;
+      const batch = Math.min(total, Math.max(2000, Math.ceil(overBy / bytesPerRow) + 1000));
+
+      const rows = await allQuery(`
+        SELECT rowid AS row_id, * FROM chat_messages ORDER BY saved_at ASC, rowid ASC LIMIT ?
+      `, [batch]);
+      if (!rows.length) break;
+
+      await runQuery('BEGIN');
+      try {
+        for (const row of rows) {
+          await runQuery(`
+            INSERT OR IGNORE INTO archive_shard.chat_messages (
+              message_id, chat_id, sender_user_id, sender_slug, sender_username,
+              content, message_type, created_at, raw_payload, saved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          `, [
+            row.message_id, row.chat_id, row.sender_user_id, row.sender_slug,
+            row.sender_username, row.content, row.message_type, row.created_at,
+            row.raw_payload, row.saved_at
+          ]);
+          await runQuery('DELETE FROM chat_messages WHERE rowid = ?', [row.row_id]);
+        }
+        await runQuery('COMMIT');
+      } catch (error) {
+        try { await runQuery('ROLLBACK'); } catch { /* no open transaction */ }
+        throw error;
+      }
+
+      archived += rows.length;
+      await vacuumDatabase();
+      size = getDatabaseSizeBytes();
+    }
+  } finally {
+    // Only detach if still attached (a shard rollover detaches first).
+    try {
+      await runQuery(`DETACH DATABASE archive_shard`);
+    } catch { /* already detached */ }
+  }
+
+  writeMaintenanceState({ ...readMaintenanceState(), archiveShard: shardName });
+  if (archived > 0) {
+    console.log(`[DB] archived ${archived} message(s) into archive shards (latest: ${shardName}); main DB is now ${formatMiB(size)}`);
+  }
+  return archived;
+}
+
 async function runChatStorageMaintenance({ force = false, quiet = false } = {}) {
   const startedAt = Date.now();
   const before = getDatabaseSizeBytes();
@@ -888,26 +1082,39 @@ async function runChatStorageMaintenance({ force = false, quiet = false } = {}) 
     writeMaintenanceState({ ...state, payloadMigrationAt: startedAt });
   }
 
-  const aged = await pruneChatMessagesByAge(CHAT_RETENTION_DAYS);
+  const aged = CHAT_RETENTION_UNLIMITED ? 0 : await pruneChatMessagesByAge(CHAT_RETENTION_DAYS);
   const reclaimable = await getReclaimableBytes();
   if ((migrated > 0 || aged > 0) && reclaimable >= VACUUM_MIN_RECLAIM_BYTES) {
     await vacuumDatabase();
   }
 
+  let archived = 0;
   let capped = 0;
   if (getDatabaseSizeBytes() > CHAT_MAX_DB_BYTES) {
-    capped = await enforceChatSizeCap(CHAT_MAX_DB_BYTES);
+    // First choice: move the oldest messages into archive shards (nothing is
+    // lost). Deletion only happens if archiving itself failed.
+    try {
+      archived = await archiveOldestMessages(CHAT_MAX_DB_BYTES);
+    } catch (error) {
+      console.warn('[DB] archiving failed, falling back to deletion:', error.message);
+      try { await vacuumDatabase(); } catch { /* ignore */ }
+    }
+    if (getDatabaseSizeBytes() > CHAT_MAX_DB_BYTES) {
+      capped = await enforceChatSizeCap(CHAT_MAX_DB_BYTES);
+    }
   }
 
   const after = getDatabaseSizeBytes();
-  if (!quiet && (migrated > 0 || aged > 0 || capped > 0)) {
+  if (!quiet && (migrated > 0 || aged > 0 || archived > 0 || capped > 0)) {
     console.log(
-      `[DB] chat storage: slimmed ${migrated} legacy payload(s), pruned ${aged} message(s) past ${CHAT_RETENTION_DAYS}d retention, ` +
-      `pruned ${capped} message(s) over the ${formatMiB(CHAT_MAX_DB_BYTES)} cap; ${formatMiB(before)} -> ${formatMiB(after)}`
+      `[DB] chat storage: slimmed ${migrated} legacy payload(s), ` +
+      (CHAT_RETENTION_UNLIMITED ? 'retention unlimited, ' : `pruned ${aged} message(s) past ${CHAT_RETENTION_DAYS}d retention, `) +
+      `archived ${archived} message(s) to shards, pruned ${capped} message(s) over the ${formatMiB(CHAT_MAX_DB_BYTES)} cap; ` +
+      `${formatMiB(before)} -> ${formatMiB(after)}`
     );
   }
 
-  return { migrated, aged, capped, before, after, overPushLimit: after > GITHUB_FILE_SIZE_LIMIT_BYTES };
+  return { migrated, aged, archived, capped, before, after, overPushLimit: after > GITHUB_FILE_SIZE_LIMIT_BYTES };
 }
 
 async function main() {
@@ -927,6 +1134,15 @@ async function main() {
     console.log(`[DB] kick_tracker.db is ${formatMiB(result.after)} (${status})`);
     db.close();
     if (result.overPushLimit) process.exitCode = 1;
+    return;
+  }
+
+  if (process.argv[2] === '--archive') {
+    // Force the archive pass: move the oldest messages into shard files until
+    // the tracked database is back under the size cap. Never deletes messages.
+    const result = await runChatStorageMaintenance({ force: true });
+    console.log(`[DB] archive pass done: ${result.archived} message(s) moved to shards; kick_tracker.db is ${formatMiB(result.after)}`);
+    db.close();
     return;
   }
 
@@ -1119,6 +1335,8 @@ async function monitorTargets() {
 async function checkStreamerTagsOnce(shouldStop = () => false) {
   const tags = getStreamerTags();
   console.log(`[MONITOR] Checking ${tags.length} unique streamer tags...`);
+  const runStartIso = new Date().toISOString();
+  const runStats = { chatters: 0, messages: 0 };
 
   for (const tag of tags) {
     if (shouldStop()) break;
@@ -1126,15 +1344,16 @@ async function checkStreamerTagsOnce(shouldStop = () => false) {
       const payload = await fetchChannelByTag(tag);
       await processChannelPayload(payload);
       const chatResult = await collectAndLogChat(payload, tag);
-      if (chatResult.savedMessages || chatResult.discoveredUsers) {
-        console.log(`[CHAT] @${payload.slug || tag}: saved ${chatResult.savedMessages} messages, discovered ${chatResult.discoveredUsers} users`);
-      }
+      runStats.chatters += chatResult.discoveredUsers || 0;
+      runStats.messages += chatResult.savedMessages || 0;
     } catch (error) {
       console.warn(`[MONITOR] @${tag}: ${error.message}`);
     }
     // Small pause to stay friendly to the Kick API.
     await new Promise(resolve => setTimeout(resolve, 400));
   }
+
+  recordRunSummary(runStats, runStartIso);
 
   // Runs after every poll cycle: cheap (indexed prune, no VACUUM unless rows
   // were actually freed) and keeps skirting GitHub's 100 MiB per-file push limit.

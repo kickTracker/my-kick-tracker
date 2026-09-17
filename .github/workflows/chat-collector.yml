@@ -60,30 +60,42 @@ jobs:
           }
 
           push_chat_data() {
-            # Never hand GitHub a file over its hard 100 MiB per-file push limit.
-            # On 2026-09-15 kick_tracker.db crossed it and EVERY push was rejected
-            # while the worker kept collecting; the job still reported success, so
-            # the auto cycle silently stopped updating origin/main. `npm run prune`
-            # slims old chat payloads, applies the retention window and enforces
-            # the size cap (VACUUM included), then we double-check the result.
+            # Never hand GitHub a file over its hard 100 MiB per-file limit.
+            # Before pushing: `npm run prune` slims old chat payloads, applies
+            # the retention window, then moves the OLDEST messages into
+            # archive/kick_tracker-NNN.db shards (nothing is deleted unless
+            # archiving fails). We then double-check every committed DB file.
             npm run prune || echo "[prune] maintenance reported a problem; continuing"
 
-            DB_BYTES=$(stat -c%s kick_tracker.db 2>/dev/null || echo 0)
-            echo "[push] kick_tracker.db is $(( DB_BYTES / 1024 / 1024 )) MiB"
-            if [ "$DB_BYTES" -ge 104857600 ]; then
-              echo "[push] ABORT: database is still at/above GitHub's 100 MiB per-file limit;"
-              echo "[push] skipping this push so we keep collecting. Lower CHAT_MAX_DB_MB or CHAT_RETENTION_DAYS if this repeats."
+            OVER_LIMIT=0
+            for DB_FILE in kick_tracker.db archive/*.db; do
+              [ -f "$DB_FILE" ] || continue
+              DB_BYTES=$(stat -c%s "$DB_FILE" 2>/dev/null || echo 0)
+              echo "[push] $DB_FILE is $(( DB_BYTES / 1024 / 1024 )) MiB"
+              if [ "$DB_BYTES" -ge 104857600 ]; then
+                echo "[push] ABORT: $DB_FILE is at/above GitHub's 100 MiB per-file limit."
+                OVER_LIMIT=1
+              fi
+            done
+            if [ "$OVER_LIMIT" = "1" ]; then
+              echo "[push] skipping this push so we keep collecting."
               return 1
             fi
 
             git add -f kick_tracker.db logz.txt || return 1
+            git add -f archive/*.db 2>/dev/null || true
 
             if git diff --staged --quiet; then
               echo "[push] nothing new to push"
               return 0
             fi
 
-            git commit -m "auto: chat messages update [skip ci]" || return 1
+            # Human-readable window summary in the commit message.
+            SUMMARY=$(node -p '(()=>{try{const t=JSON.parse(require("fs").readFileSync(".chat-tally.json","utf8"));return "+"+t.chatters+" chatters, +"+t.messages+" messages in "+t.polls+" polls ("+t.start+" -> "+t.finish+")"}catch(e){return "+ chat data"}})()' 2>/dev/null || echo "+ chat data")
+            git commit -m "auto: chat update $SUMMARY [skip ci]" || return 1
+
+            # Window closed: reset the tally so the next push describes only new data.
+            echo '{"start":null,"finish":null,"polls":0,"chatters":0,"messages":0}' > .chat-tally.json
 
             for attempt in 1 2 3; do
               if git push origin main; then
