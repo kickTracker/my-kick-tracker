@@ -96,6 +96,10 @@
       });
     }
 
+    const API_BASE = (typeof window !== 'undefined' && window.KICK_API_BASE) ? window.KICK_API_BASE : '';
+
+    let sqlDbPromise = null;
+
     async function loadUsers() {
       const status = document.getElementById('status');
       try {
@@ -112,8 +116,6 @@
         renderUsers();
       } catch (error) { status.innerText = error.message; }
     }
-
-    const API_BASE = (typeof window !== 'undefined' && window.KICK_API_BASE) ? window.KICK_API_BASE : '';
 
     // Preferred: the /v1/api endpoint (fast, token-gated, rate limited).
     // Static hosting (GitHub Pages) has no server, so fall back to reading the
@@ -146,7 +148,6 @@
       return staticLatestUsers();
     }
 
-    let sqlDbPromise = null;
     function loadStaticDb() {
       if (!sqlDbPromise) {
         sqlDbPromise = new Promise((resolve, reject) => {
