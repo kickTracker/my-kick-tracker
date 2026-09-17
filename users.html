@@ -99,18 +99,7 @@
     async function loadUsers() {
       const status = document.getElementById('status');
       try {
-        // Fast path: the server-side API (token injected into this page).
-        const tokenMeta = document.querySelector('meta[name="api-token"]');
-        const response = await fetch('/v1/api/users/latest', {
-          cache: 'no-store',
-          headers: tokenMeta ? { 'X-API-Token': tokenMeta.content } : {}
-        });
-        if (!response.ok) {
-          if (response.status === 429) throw new Error('Resting time - too many requests. Try again shortly.');
-          if (response.status === 403) throw new Error('Session token expired - refresh the page to continue.');
-          throw new Error('API unavailable.');
-        }
-        const payload = await response.json();
+        const payload = await fetchLatestUsers();
         users = (payload.users || []).map(row => ({
           id: row.id,
           current_slug: row.slug,
@@ -122,6 +111,89 @@
         status.innerText = '';
         renderUsers();
       } catch (error) { status.innerText = error.message; }
+    }
+
+    const API_BASE = (typeof window !== 'undefined' && window.KICK_API_BASE) ? window.KICK_API_BASE : '';
+
+    // Preferred: the /v1/api endpoint (fast, token-gated, rate limited).
+    // Static hosting (GitHub Pages) has no server, so fall back to reading the
+    // committed kick_tracker.db in the browser with sql.js.
+    async function fetchLatestUsers() {
+      try {
+        const tokenMeta = document.querySelector('meta[name="api-token"]');
+        const response = await fetch(`${API_BASE}/v1/api/users/latest`, {
+          cache: 'no-store',
+          headers: tokenMeta ? { 'X-API-Token': tokenMeta.content } : {}
+        });
+        if (response.status === 429) throw new Error('Resting time - too many requests. Try again shortly.');
+        if (response.status === 403) throw new Error('Session token expired - refresh the page to continue.');
+        if (response.ok) {
+          const payload = await response.json();
+          return {
+            total: payload.total || 0,
+            users: (payload.users || []).map(row => ({
+              id: row.id,
+              slug: row.slug,
+              username: row.username,
+              followers: row.followers,
+              last_updated: row.last_updated
+            }))
+          };
+        }
+      } catch (error) {
+        if (error && error.message && (error.message.startsWith('Resting time') || error.message.startsWith('Session token'))) throw error;
+      }
+      return staticLatestUsers();
+    }
+
+    let sqlDbPromise = null;
+    function loadStaticDb() {
+      if (!sqlDbPromise) {
+        sqlDbPromise = new Promise((resolve, reject) => {
+          const script = document.createElement('script');
+          script.src = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js';
+          script.onerror = () => reject(new Error('sql.js could not load.'));
+          script.onload = async () => {
+            try {
+              const SQL = await initSqlJs({ locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}` });
+              const response = await fetch('./kick_tracker.db', { cache: 'no-store' });
+              if (!response.ok) throw new Error('Database unavailable.');
+              resolve(new SQL.Database(new Uint8Array(await response.arrayBuffer())));
+            } catch (error) { reject(error); }
+          };
+          document.head.appendChild(script);
+        });
+      }
+      return sqlDbPromise;
+    }
+
+    function execAll(db, sql) {
+      const statement = db.prepare(sql);
+      const rows = [];
+      while (statement.step()) rows.push(statement.getAsObject());
+      statement.free();
+      return rows;
+    }
+
+    async function staticLatestUsers() {
+      const db = await loadStaticDb();
+      const total = Number(execAll(db, 'SELECT COUNT(*) AS n FROM channels')[0]?.n) || 0;
+      const rows = execAll(db, `
+        SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated
+        FROM channels c
+        ORDER BY (SELECT MIN(h.id) FROM username_history h WHERE h.channel_id = c.id) DESC, c.id DESC
+        LIMIT 100
+      `);
+      return {
+        total,
+        users: rows.map(row => ({
+          id: row.id,
+          slug: row.current_slug,
+          username: row.current_username,
+          followers: row.followers_count,
+          last_updated: row.last_updated
+        }))
+      };
     }
 
     const MAX_USERS_SHOWN = 100;

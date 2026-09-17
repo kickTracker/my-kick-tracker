@@ -416,6 +416,8 @@
         const CONSENT_STORAGE_KEY = 'kickintel-consent';
     let apiReady = false;
     let homeStats = null;
+    let dataSource = 'unknown';
+    let apiAvailable = false;
     let currentFollowerRows = [];
     let currentUsernameRows = [];
     let currentSocialRows = [];
@@ -483,15 +485,139 @@
       cursorGlow.style.transform = `translate3d(${e.clientX}px, ${e.clientY}px, 0)`;
     });
 
+        // --- Data layer -------------------------------------------------------
+        // Preferred: the /v1/api endpoints from server.js (fast, token-gated,
+        // rate limited). On static hosting (GitHub Pages) no server exists, so
+        // every request 404s and we transparently fall back to querying the
+        // committed kick_tracker.db in the browser with sql.js.
+        // Point this at a remote API host to keep using the API while the page
+        // itself is served statically, e.g. window.KICK_API_BASE = 'https://api.example.com'.
+        const API_BASE = (typeof window !== 'undefined' && window.KICK_API_BASE) ? window.KICK_API_BASE : '';
+
+        let sqlDbPromise = null;
+        function loadStaticDb() {
+          if (!sqlDbPromise) {
+            sqlDbPromise = new Promise((resolve, reject) => {
+              const script = document.createElement('script');
+              script.src = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js';
+              script.onerror = () => reject(new Error('sql.js could not load.'));
+              script.onload = async () => {
+                try {
+                  const SQL = await initSqlJs({ locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}` });
+                  const response = await fetch('./kick_tracker.db', { cache: 'no-store' });
+                  if (!response.ok) throw new Error('Database unavailable.');
+                  resolve(new SQL.Database(new Uint8Array(await response.arrayBuffer())));
+                } catch (error) { reject(error); }
+              };
+              document.head.appendChild(script);
+            });
+          }
+          return sqlDbPromise;
+        }
+
+        function execAll(db, sql, params = []) {
+          const statement = db.prepare(sql);
+          if (params.length) statement.bind(params);
+          const rows = [];
+          while (statement.step()) rows.push(statement.getAsObject());
+          statement.free();
+          return rows;
+        }
+
+        async function fetchStats() {
+          try {
+            const response = await fetch(`${API_BASE}/v1/api/stats`, { cache: 'no-store' });
+            if (response.ok) {
+              dataSource = 'api';
+              apiAvailable = true;
+              return await response.json();
+            }
+          } catch (error) { /* fall through to static data */ }
+          dataSource = 'static';
+          apiAvailable = false;
+          const db = await loadStaticDb();
+          const count = table => Number(execAll(db, `SELECT COUNT(*) AS n FROM ${table}`)[0]?.n) || 0;
+          return { channels: count('channels'), chat_users: count('chat_users'), chat_messages: count('chat_messages') };
+        }
+
+        // Returns the same shape as /v1/api/user/:handle, or null when unknown.
+        async function staticProfile(handle) {
+          const db = await loadStaticDb();
+          const history = execAll(db, `
+            SELECT c.id AS channel_id
+            FROM username_history h
+            JOIN channels c ON h.channel_id = c.id
+            WHERE LOWER(h.slug) = ? OR LOWER(h.username) = ? OR LOWER(c.current_slug) = ?
+            ORDER BY h.detected_at ASC
+          `, [handle, handle, handle]);
+          if (!history.length) return null;
+
+          const channelId = history[0].channel_id;
+          const channel = execAll(db, 'SELECT * FROM channels WHERE id = ?', [channelId])[0];
+          if (!channel) return null;
+
+          const usernames = execAll(db, `
+            SELECT slug, username, detected_at FROM username_history
+            WHERE channel_id = ? ORDER BY detected_at ASC
+          `, [channelId]);
+          const socials = execAll(db, `
+            SELECT field_name, old_value, new_value, detected_at FROM socials_history
+            WHERE channel_id = ? ORDER BY detected_at DESC
+          `, [channelId]);
+          const followers = execAll(db, `
+            SELECT followers_count, recorded_at FROM follower_history
+            WHERE channel_id = ? ORDER BY recorded_at ASC
+          `, [channelId]);
+          const senderId = channel.user_id || channelId;
+          const messages = execAll(db, `
+            SELECT m.chat_id, m.content, m.message_type, m.created_at, m.saved_at, m.raw_payload,
+                   m.sender_slug, m.sender_username,
+                   c.current_slug AS channel_slug
+            FROM chat_messages m
+            LEFT JOIN channels c ON c.id = m.chat_id
+            WHERE m.sender_user_id = ?
+            ORDER BY COALESCE(m.created_at, m.saved_at) DESC
+            LIMIT 500
+          `, [senderId]);
+          const total = Number(execAll(db, 'SELECT COUNT(*) AS n FROM chat_messages WHERE sender_user_id = ?', [senderId])[0]?.n) || 0;
+
+          return {
+            ...channel,
+            username_history: usernames,
+            socials_history: socials,
+            follower_history: followers,
+            chat_messages: messages,
+            chat_messages_total: total,
+            chat_messages_archived: 0
+          };
+        }
+
+        async function fetchProfile(handle) {
+          // Only consult the API when it is actually reachable. On static
+          // hosting every /v1/api request 404s, and a 404 there means "no API",
+          // NOT "no such user" - so we must not report a missing profile.
+          if (apiAvailable) {
+            try {
+              const response = await fetch(`${API_BASE}/v1/api/user/${encodeURIComponent(handle)}`, { cache: 'no-store' });
+              if (response.ok) return await response.json();
+              if (response.status === 404) return null;
+              if (response.status === 429) throw new Error('Resting time - too many requests. Try again shortly.');
+            } catch (error) {
+              if (error && error.message && error.message.startsWith('Resting time')) throw error;
+            }
+          }
+          return staticProfile(handle);
+        }
+
         async function initApi() {
       const statusEl = document.getElementById('status');
       try {
         statusEl.innerText = "Loading...";
-        const response = await fetch('/v1/api/stats', { cache: 'no-store' });
-        if (!response.ok) throw new Error('API unavailable.');
-        homeStats = await response.json();
+        homeStats = await fetchStats();
         apiReady = true;
-        statusEl.innerText = "Ready. Search any handle above.";
+        statusEl.innerText = dataSource === 'api'
+          ? "Ready. Search any handle above."
+          : "Ready (static data mode). Search any handle above.";
         loadHomeStats();
         loadFeaturedGrid();
         checkUrl();
@@ -1025,23 +1151,8 @@
       }
 
       try {
-        // One fast server-side API call replaces the full-database download.
-        const response = await fetch(`/v1/api/user/${encodeURIComponent(queryHandle)}`, { cache: 'no-store' });
-        if (response.status === 404) {
-          statusEl.innerText = `No records found for handle: "${queryHandle}"`;
-          showToast('No records found for that handle.');
-          cardEl.classList.add('hidden');
-          featuredEl.classList.remove('hidden');
-          return;
-        }
-        if (response.status === 429) {
-          statusEl.innerText = 'Resting time - too many requests. Try again shortly.';
-          showToast('Resting time. Try again in a moment.');
-          return;
-        }
-        if (!response.ok) throw new Error('API unavailable.');
-
-        const channel = await response.json();
+        // One fast server-side API call when available; static DB otherwise.
+        const channel = await fetchProfile(queryHandle);
         if (!channel || !channel.id) {
           statusEl.innerText = `No records found for handle: "${queryHandle}"`;
           showToast('No records found for that handle.');
