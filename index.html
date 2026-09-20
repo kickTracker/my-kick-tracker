@@ -541,6 +541,16 @@
         }
 
         // Returns the same shape as /v1/api/user/:handle, or null when unknown.
+        // created_at (Kick ISO) and saved_at (SQLite) mix timestamp formats, so
+        // normalize to epoch ms before sorting (string compares get it wrong).
+        function chatTimestampMs(row) {
+          const value = row?.created_at || row?.saved_at;
+          if (!value) return 0;
+          const text = String(value);
+          const date = new Date(text.includes('T') ? text : `${text.replace(' ', 'T')}Z`);
+          const ms = date.getTime();
+          return Number.isFinite(ms) ? ms : 0;
+        }
         async function staticProfile(handle) {
           const db = await loadStaticDb();
           const history = execAll(db, `
@@ -580,6 +590,7 @@
             LIMIT 500
           `, [senderId]);
           const total = Number(execAll(db, 'SELECT COUNT(*) AS n FROM chat_messages WHERE sender_user_id = ?', [senderId])[0]?.n) || 0;
+          messages.sort((a, b) => chatTimestampMs(b) - chatTimestampMs(a));
 
           return {
             ...channel,

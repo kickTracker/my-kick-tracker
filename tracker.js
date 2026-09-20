@@ -2,6 +2,12 @@ import puppeteer from 'puppeteer';
 import sqlite3 from 'sqlite3';
 
 const db = new sqlite3.Database('./kick_tracker.db');
+// Legacy-data repair passes in initDb() are full-table scans over the whole
+// database. They only fix historical shapes, but they used to run on EVERY
+// poll (each CI poll is a fresh process), so their cost grew with the DB
+// forever. Once every 6h is plenty.
+const DB_REPAIR_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
 
 // Promisified DB helpers
 function runQuery(sql, params = []) {
@@ -165,17 +171,25 @@ async function initDb() {
       )
     `);
 
-    await repairCurrentFollowerSnapshots();
+    // Full-table-scan repairs, gated to run at most once per DB_REPAIR_INTERVAL_MS
+    // so per-poll CI runs stay cheap as the database grows.
+    const repairState = readMaintenanceState();
+    const repairsDue = !repairState.repairsAt
+      || (Date.now() - Number(repairState.repairsAt)) >= DB_REPAIR_INTERVAL_MS;
+    if (repairsDue) {
+      await repairCurrentFollowerSnapshots();
 
-    await runQuery(`
-      UPDATE channels
-      SET is_banned = NULL
-      WHERE is_banned = 0
-        AND (
-          raw_payload IS NULL
-          OR raw_payload NOT LIKE '%"is_banned"%'
-        )
-    `);
+      await runQuery(`
+        UPDATE channels
+        SET is_banned = NULL
+        WHERE is_banned = 0
+          AND (
+            raw_payload IS NULL
+            OR raw_payload NOT LIKE '%"is_banned"%'
+          )
+      `);
+      writeMaintenanceState({ ...repairState, repairsAt: Date.now() });
+    }
   } catch (error) {
     console.error('[DB] Initialization failed:', error.message);
     throw error;
@@ -287,8 +301,10 @@ async function processChannelPayload(data) {
   // Subscription / Monetized status check
   const subscriptionEnabled = (data.subscription_enabled || data.is_affiliate) ? 1 : 0;
   
-  // Extract vod_enabled from data object or fallback check
-  const vodEnabled = (data.vod_enabled === true || (data.vod_enabled !== false && data.vod_enabled !== 0)) ? 1 : 0;
+  // Extract vod_enabled: a missing field must mean disabled (the old ternary
+  // treated `undefined` as enabled, and disagreed with the slim payload's
+  // `Boolean(data.vod_enabled)` which treats it as disabled).
+  const vodEnabled = (data.vod_enabled === true || data.vod_enabled === 1) ? 1 : 0;
 
   const livestreamTitle = data.livestream ? data.livestream.session_title : null;
   // Slim payload: keep only what the frontend/tracker actually read.
@@ -493,6 +509,12 @@ async function saveChatHistory(chatId, historyPayload) {
     if (senderId && !uniqueSenders.has(senderId)) uniqueSenders.set(senderId, sender);
   }
 
+  // A chatter counts as "discovered" exactly once per poll: the loop above
+  // already found the ones missing from chat_users, and the upsert below runs
+  // once per message. The old code counted the same new chatter twice (once
+  // here, once in the per-message loop) and re-queried chat_users for every
+  // single message.
+  const newSenderIds = new Set(uniqueSenders.keys());
   for (const senderId of uniqueSenders.keys()) {
     const existingUser = await getQuery('SELECT user_id FROM chat_users WHERE user_id = ?', [senderId]);
     if (!existingUser) {
@@ -500,7 +522,6 @@ async function saveChatHistory(chatId, historyPayload) {
       // every known chatter on every poll caused Kick API 429 rate limits.
       const sender = uniqueSenders.get(senderId);
       await refreshChatUserChannel(sender, senderId);
-      discoveredUsers += 1;
     }
   }
 
@@ -508,7 +529,6 @@ async function saveChatHistory(chatId, historyPayload) {
     const sender = message.sender || {};
     const senderId = Number(sender.id || message.user_id) || null;
     if (senderId) {
-      const existingUser = await getQuery('SELECT user_id FROM chat_users WHERE user_id = ?', [senderId]);
       await runQuery(`
         INSERT INTO chat_users (user_id, current_slug, current_username, raw_identity, last_seen_at)
         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
@@ -518,7 +538,7 @@ async function saveChatHistory(chatId, historyPayload) {
           raw_identity = excluded.raw_identity,
           last_seen_at = CURRENT_TIMESTAMP
       `, [senderId, sender.slug || null, sender.username || sender.slug || null, JSON.stringify(sender)]);
-      if (!existingUser) discoveredUsers += 1;
+      if (newSenderIds.delete(senderId)) discoveredUsers += 1;
     }
 
     if (!message.id) continue;
@@ -560,7 +580,8 @@ async function refreshChatUserChannel(sender, senderId) {
   try {
     await throttleKickRequest();
     const response = await fetch(`https://kick.com/api/v1/channels/${encodeURIComponent(sender.slug)}`, {
-      headers: { 'User-Agent': 'KickIntel Tracker/1.0', Accept: 'application/json' }
+      headers: { 'User-Agent': 'KickIntel Tracker/1.0', Accept: 'application/json' },
+      signal: AbortSignal.timeout(15000)
     });
     if (!response.ok) return false;
     const payload = await response.json();
@@ -583,7 +604,8 @@ async function fetchLiveChatHistory(data) {
   if (!chatId) return { savedMessages: 0, discoveredUsers: 0 };
 
   const response = await fetch(`https://web.kick.com/api/v1/chat/${encodeURIComponent(chatId)}/history`, {
-    headers: { 'User-Agent': 'KickIntel Tracker/1.0', Accept: 'application/json' }
+    headers: { 'User-Agent': 'KickIntel Tracker/1.0', Accept: 'application/json' },
+    signal: AbortSignal.timeout(15000)
   });
   if (!response.ok) throw new Error(`Chat history returned ${response.status}`);
   const payload = await response.json();
@@ -843,6 +865,17 @@ function readMaintenanceState() {
 function writeMaintenanceState(state) {
   try {
     fs.writeFileSync(MAINTENANCE_STATE_PATH, JSON.stringify(state), 'utf8');
+    // Fsync the file so the shard pointer survives CI canceling the runner
+    // mid-job: a lost pointer used to mean "start a brand-new shard".
+    // 'r+' because Windows refuses to flush buffers on a read-only handle.
+    const fd = fs.openSync(MAINTENANCE_STATE_PATH, 'r+');
+    try {
+      fs.fsyncSync(fd);
+    } catch {
+      // Best effort: the write itself already succeeded.
+    } finally {
+      fs.closeSync(fd);
+    }
   } catch (error) {
     console.warn('[DB] Could not persist maintenance state:', error.message);
   }
@@ -936,6 +969,36 @@ async function enforceChatSizeCap(maxBytes) {
   return deleted;
 }
 
+// Pick the shard new archived messages should go into:
+//   1. the maintenance-state file's shard, if it exists and still has room,
+//   2. otherwise the highest-numbered existing shard that still has room,
+//   3. only when every shard is at/over the cap: a brand-new one.
+// Step 2 is the fix for the shard explosion: the state file is gitignored, so
+// every fresh CI run used to hit step 3 and mint a new kick_tracker-NNN.db,
+// leaving dozens of tiny shards instead of a few ~90 MiB ones.
+function pickArchiveShard() {
+  fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+  const shards = fs.readdirSync(ARCHIVE_DIR)
+    .map(name => ({ name, match: /^kick_tracker-(\d+)\.db$/.exec(name) }))
+    .filter(entry => entry.match)
+    .map(entry => {
+      let bytes = 0;
+      try { bytes = fs.statSync(`${ARCHIVE_DIR}/${entry.name}`).size; } catch { /* vanished mid-run */ }
+      return { name: entry.name, num: Number(entry.match[1]), bytes };
+    })
+    .sort((a, b) => b.num - a.num);
+
+  const state = readMaintenanceState();
+  const stateShard = shards.find(shard => shard.name === state.archiveShard);
+  if (stateShard && stateShard.bytes < ARCHIVE_SHARD_MAX_BYTES) return stateShard.name;
+
+  const reusable = shards.find(shard => shard.bytes < ARCHIVE_SHARD_MAX_BYTES);
+  if (reusable) return reusable.name;
+
+  const nextNumber = shards.length > 0 ? shards[0].num + 1 : 1;
+  return `kick_tracker-${String(nextNumber).padStart(3, '0')}.db`;
+}
+
 async function archiveOldestMessages(maxBytes) {
   // Instead of deleting history when the tracked database grows past the cap,
   // move the oldest chat messages into shard files (archive/kick_tracker-NNN.db).
@@ -947,19 +1010,9 @@ async function archiveOldestMessages(maxBytes) {
 
   fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 
-  const state = readMaintenanceState();
-  let shardName = typeof state.archiveShard === 'string' && /^kick_tracker-\d+\.db$/.test(state.archiveShard)
-    ? state.archiveShard
-    : null;
-
-  if (!shardName) {
-    const existing = fs.readdirSync(ARCHIVE_DIR)
-      .map(name => /^kick_tracker-(\d+)\.db$/.exec(name))
-      .filter(Boolean)
-      .map(match => Number(match[1]))
-      .sort((a, b) => b - a);
-    shardName = `kick_tracker-${String((existing[0] || 0) + 1).padStart(3, '0')}.db`;
-  }
+  // NOTE: the state file is only a hint; pickArchiveShard() validates it
+  // against the actual shard files on disk (see the shard-explosion fix).
+  let shardName = pickArchiveShard();
 
   // The path is generated locally and validated above, so it is safe to inline.
   const shardPath = `${ARCHIVE_DIR}/${shardName}`;
@@ -990,12 +1043,9 @@ async function archiveOldestMessages(maxBytes) {
       const shardBytes = fs.existsSync(shardPath) ? fs.statSync(shardPath).size : 0;
       if (shardBytes >= ARCHIVE_SHARD_MAX_BYTES) {
         // This shard is full: roll over to the next numbered shard.
-        const existing = fs.readdirSync(ARCHIVE_DIR)
-          .map(name => /^kick_tracker-(\d+)\.db$/.exec(name))
-          .filter(Boolean)
-          .map(match => Number(match[1]))
-          .sort((a, b) => b - a);
-        shardName = `kick_tracker-${String((existing[0] || 0) + 1).padStart(3, '0')}.db`;
+        // pickArchiveShard() skips the just-filled shard because its size is
+        // now at/over the cap.
+        shardName = pickArchiveShard();
         await runQuery(`DETACH DATABASE archive_shard`);
         await runQuery(`ATTACH DATABASE '${`${ARCHIVE_DIR}/${shardName}`.replace(/'/g, "''")}' AS archive_shard`);
         await runQuery(`
@@ -1200,7 +1250,8 @@ async function main() {
     try {
       console.log(`Fetching target: ${refreshTarget}...`);
       const response = await fetch(`https://kick.com/api/v1/channels/${encodeURIComponent(refreshTarget)}`, {
-        headers: { 'User-Agent': 'KickIntel Tracker/1.0' }
+        headers: { 'User-Agent': 'KickIntel Tracker/1.0' },
+        signal: AbortSignal.timeout(15000)
       });
       if (!response.ok) throw new Error(`Kick API returned ${response.status}`);
       const data = await response.json();
@@ -1288,7 +1339,8 @@ async function fetchChannelByTag(tag) {
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
     await throttleKickRequest();
     const response = await fetch(`https://kick.com/api/v1/channels/${encodeURIComponent(tag)}`, {
-      headers: { 'User-Agent': 'KickIntel Tracker/1.0', Accept: 'application/json' }
+      headers: { 'User-Agent': 'KickIntel Tracker/1.0', Accept: 'application/json' },
+      signal: AbortSignal.timeout(15000)
     });
     if (response.ok) {
       const payload = await response.json();

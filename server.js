@@ -73,6 +73,19 @@ function shuffledByWindow(rows, windowIndex) {
   return copy;
 }
 
+// chat_messages timestamps mix two shapes: Kick ISO "2026-09-20T12:00:03.000Z"
+// (created_at) and SQLite CURRENT_TIMESTAMP "2026-09-20 12:00:03" (saved_at).
+// Raw string comparison ranks 'T' above ' ', so an ISO timestamp sorts after
+// every same-day SQLite timestamp. Normalize both to epoch ms before sorting.
+function chatTimestampMs(row) {
+  const value = row?.created_at || row?.saved_at;
+  if (!value) return 0;
+  const text = String(value);
+  const date = new Date(text.includes('T') ? text : `${text.replace(' ', 'T')}Z`);
+  const ms = date.getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
 // --- API "resting time": per-IP rate limiting with escalating cooldowns -------
 const RESTING_TIME = {
   'users-latest': { max: 2, windowMs: 60 * 1000, baseCooldownMs: 5 * 60 * 1000 },
@@ -119,7 +132,6 @@ function checkRestingTime(ip, bucket) {
   return { ok: true };
 }
 
-const allowedPaths = new Set(['/','/index.html','/users','/users.html','/privacy.html','/terms.html']);
 const mimeTypes = {
   '.html': 'text/html; charset=utf-8',
   '.css': 'text/css; charset=utf-8',
@@ -471,11 +483,7 @@ async function handleV1User(req, res, handle, ip) {
               merged.push(row);
             }
           }
-          merged.sort((a, b) => {
-            const av = String(a.created_at || a.saved_at || '');
-            const bv = String(b.created_at || b.saved_at || '');
-            return bv.localeCompare(av);
-          });
+          merged.sort((a, b) => chatTimestampMs(b) - chatTimestampMs(a));
           return merged.slice(0, PROFILE_MESSAGES_MAX);
         }
       });
@@ -762,9 +770,9 @@ const server = createServer(async (req, res) => {
       return;
     }
 
-    // /kick_tracker.db is intentionally NOT served: the site reads everything
-    // through /v1/api, and a public bulk download would bypass every
-    // anti-scraping protection on the API.
+    // Anything else is a 404. (kick_tracker.db is intentionally NOT served: the
+    // site reads everything through /v1/api, and a public bulk download would
+    // bypass every anti-scraping protection on the API.)
 
     if (pathname === '/privacy.html' || pathname === '/terms.html') {
       await serveFile(pathname.slice(1), res);
@@ -786,12 +794,6 @@ const server = createServer(async (req, res) => {
 
     if (pathname.includes('..')) {
       res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' });
-      res.end(await getNotFoundPage());
-      return;
-    }
-
-    if (allowedPaths.has(pathname)) {
-      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       res.end(await getNotFoundPage());
       return;
     }
