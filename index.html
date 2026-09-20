@@ -541,8 +541,15 @@
           return sqliteDbCache.get(url);
         }
 
+        // Static assets (the DB and its shards) are relative so GitHub Pages
+        // project sites served under /<repo>/ resolve them correctly. With a
+        // KICK_API_BASE set, they resolve against the API host instead.
+        function staticAssetUrl(path) {
+          return API_BASE ? `${API_BASE.replace(/\/+$/, '')}/${path}` : `./${path}`;
+        }
+
         function loadStaticDb() {
-          return loadSqliteFromUrl(`${API_BASE}/kick_tracker.db`);
+          return loadSqliteFromUrl(staticAssetUrl('kick_tracker.db'));
         }
 
         function execAll(db, sql, params = []) {
@@ -655,7 +662,7 @@
           const name = `kick_tracker-${String(shardNumber).padStart(3, '0')}.db`;
           let db;
           try {
-            db = await loadSqliteFromUrl(`${API_BASE}/archive/${name}`);
+            db = await loadSqliteFromUrl(staticAssetUrl(`archive/${name}`));
           } catch (error) {
             return null;
           }
