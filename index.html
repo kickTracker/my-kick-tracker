@@ -434,6 +434,9 @@
     let staticChatShardExhausted = false;
     let staticChatLoadingMore = false;
     let currentStaticSenderUserId = null;
+    // Bumped on every search; in-flight search/load-more results compare
+    // against it and self-discard when a newer search has taken over.
+    let activeSearchToken = 0;
 
     function consentIsCurrent() {
       try {
@@ -532,14 +535,14 @@
           if (!cache) {
             const SQL = await loadSqlJs();
             const response = await fetch(url, { cache: 'no-store' });
-            if (!response.ok) throw new Error('Database unavailable.');
+            if (!response.ok) throw new Error('HTTP_' + response.status + ': Database unavailable.');
             return new SQL.Database(new Uint8Array(await response.arrayBuffer()));
           }
           if (!sqliteDbCache.has(url)) {
             const promise = (async () => {
               const SQL = await loadSqlJs();
               const response = await fetch(url, { cache: 'no-store' });
-              if (!response.ok) throw new Error('Database unavailable.');
+              if (!response.ok) throw new Error('HTTP_' + response.status + ': Database unavailable.');
               return new SQL.Database(new Uint8Array(await response.arrayBuffer()));
             })();
             // A failed download must not poison the cache forever.
@@ -548,6 +551,49 @@
           }
           return sqliteDbCache.get(url);
         }
+
+        // --- Web Worker data layer -------------------------------------------
+        // sql.js is pure CPU work on multi-MB WASM images; running it on the
+        // main thread froze the UI for seconds on large profiles. All SQL now
+        // executes inside a blob Worker; the in-page loader above is kept as a
+        // fallback for environments where blob Workers are unavailable.
+        const workerSource = `
+          importScripts('${SQLJS_BASE}/sql-wasm.js');
+          let sqlPromise = null;
+          const openDbs = new Map();
+          async function getDb(url, keepOpen) {
+            if (openDbs.has(url)) return openDbs.get(url);
+            if (!sqlPromise) sqlPromise = initSqlJs({ locateFile: file => '${SQLJS_BASE}/' + file });
+            const SQL = await sqlPromise;
+            const response = await fetch(url, { cache: 'no-store' });
+            if (!response.ok) throw new Error('HTTP_' + response.status);
+            const db = new SQL.Database(new Uint8Array(await response.arrayBuffer()));
+            if (keepOpen) openDbs.set(url, db);
+            return db;
+          }
+          self.onmessage = async (event) => {
+            const { id, url, keepOpen, close, queries } = event.data;
+            let db = null;
+            let openedHere = false;
+            try {
+              db = await getDb(url, keepOpen);
+              openedHere = !keepOpen;
+              const results = queries.map(({ sql, params }) => {
+                const statement = db.prepare(sql);
+                if (params && params.length) statement.bind(params);
+                const rows = [];
+                while (statement.step()) rows.push(statement.getAsObject());
+                statement.free();
+                return rows;
+              });
+              if (close && openedHere) { try { db.close(); } catch (e) {} }
+              self.postMessage({ id: id, ok: true, results: results });
+            } catch (error) {
+              if (db && openedHere) { try { db.close(); } catch (e) {} }
+              self.postMessage({ id: id, ok: false, error: String((error && error.message) || error) });
+            }
+          };
+        `;
 
         // Static assets (the DB and its shards) are relative so GitHub Pages
         // project sites served under /<repo>/ resolve them correctly. With a
@@ -558,6 +604,83 @@
 
         function loadStaticDb() {
           return loadSqliteFromUrl(staticAssetUrl('kick_tracker.db'));
+        }
+
+        let sqlWorker = null;
+        let sqlWorkerBroken = false;
+        const pendingWorkerQueries = new Map();
+
+        function getSqlWorker() {
+          if (sqlWorkerBroken || typeof Worker === 'undefined' || typeof Blob === 'undefined') return null;
+          if (!sqlWorker) {
+            try {
+              sqlWorker = new Worker(URL.createObjectURL(new Blob([workerSource], { type: 'application/javascript' })));
+              sqlWorker.onmessage = (event) => {
+                const id = event.data && event.data.id;
+                const pending = pendingWorkerQueries.get(id);
+                if (!pending) return;
+                pendingWorkerQueries.delete(id);
+                if (event.data.ok) pending.resolve(event.data.results);
+                else pending.reject(new Error(event.data.error));
+              };
+              sqlWorker.onerror = () => {
+                // Worker crashed: fail everything in flight and route future
+                // queries through the in-page fallback.
+                const failure = new Error('sql worker crashed');
+                pendingWorkerQueries.forEach(pending => pending.reject(failure));
+                pendingWorkerQueries.clear();
+                sqlWorkerBroken = true;
+                sqlWorker = null;
+              };
+            } catch (error) {
+              sqlWorkerBroken = true;
+              return null;
+            }
+          }
+          return sqlWorker;
+        }
+
+        function workerQuery(url, queries, { keepOpen = true, close = false } = {}) {
+          const worker = getSqlWorker();
+          if (!worker) return null;
+          return new Promise((resolve, reject) => {
+            const id = 'q' + Date.now() + '-' + Math.random().toString(36).slice(2);
+            pendingWorkerQueries.set(id, { resolve: resolve, reject: reject });
+            worker.postMessage({ id: id, url: url, keepOpen: keepOpen, close: close, queries: queries });
+          });
+        }
+
+        function withTimeout(promise, ms, label) {
+          return Promise.race([
+            promise,
+            new Promise((resolve, reject) => setTimeout(() => reject(new Error(label + ' timed out.')), ms))
+          ]);
+        }
+
+        // Blob workers have no base URL, so relative paths must be absolutized
+        // before being handed over.
+        function absoluteUrl(url) {
+          try { return new URL(url, location.href).href; } catch (error) { return url; }
+        }
+
+        // Run read-only queries against one DB file. Returns one array of rows
+        // per query, in order. keepOpen=true caches the handle (main DB);
+        // close=true opens one-shot and frees the WASM image right after the
+        // rows are extracted (archive shards). Prefers the Web Worker so the
+        // UI thread never blocks on multi-MB tables.
+        async function queryDbFile(url, queries, { keepOpen = true, close = false } = {}) {
+          const targetUrl = absoluteUrl(url);
+          const viaWorker = workerQuery(targetUrl, queries, { keepOpen: keepOpen, close: close });
+          if (viaWorker) return withTimeout(viaWorker, 180000, 'Database query');
+          const db = await withTimeout(loadSqliteFromUrl(url, { cache: keepOpen }), 180000, 'Database download');
+          try {
+            return queries.map(({ sql, params }) => execAll(db, sql, params));
+          } finally {
+            if (close) {
+              try { db.close(); } catch (error) { /* already released */ }
+              sqliteDbCache.delete(url);
+            }
+          }
         }
 
         function execAll(db, sql, params = []) {
@@ -580,9 +703,13 @@
           } catch (error) { /* fall through to static data */ }
           dataSource = 'static';
           apiAvailable = false;
-          const db = await loadStaticDb();
-          const count = table => Number(execAll(db, `SELECT COUNT(*) AS n FROM ${table}`)[0]?.n) || 0;
-          return { channels: count('channels'), chat_users: count('chat_users'), chat_messages: count('chat_messages') };
+          const results = await queryDbFile(staticAssetUrl('kick_tracker.db'), [
+            { sql: 'SELECT COUNT(*) AS n FROM channels' },
+            { sql: 'SELECT COUNT(*) AS n FROM chat_users' },
+            { sql: 'SELECT COUNT(*) AS n FROM chat_messages' }
+          ], { keepOpen: true });
+          const count = rows => Number(rows[0] && rows[0].n) || 0;
+          return { channels: count(results[0]), chat_users: count(results[1]), chat_messages: count(results[2]) };
         }
 
         // Returns the same shape as /v1/api/user/:handle, or null when unknown.
@@ -597,44 +724,47 @@
           return Number.isFinite(ms) ? ms : 0;
         }
         async function staticProfile(handle) {
-          const db = await loadStaticDb();
-          const history = execAll(db, `
-            SELECT c.id AS channel_id
-            FROM username_history h
-            JOIN channels c ON h.channel_id = c.id
-            WHERE LOWER(h.slug) = ? OR LOWER(h.username) = ? OR LOWER(c.current_slug) = ?
-            ORDER BY h.detected_at ASC
-          `, [handle, handle, handle]);
+          const dbUrl = staticAssetUrl('kick_tracker.db');
+          // Round 1 resolves the channel; round 2 runs everything else in one
+          // worker batch. sender_user_id is resolved server-side with
+          // COALESCE(user_id, id), matching the old channel.user_id || id.
+          const history = (await queryDbFile(dbUrl, [
+            { sql: `
+              SELECT c.id AS channel_id
+              FROM username_history h
+              JOIN channels c ON h.channel_id = c.id
+              WHERE LOWER(h.slug) = ? OR LOWER(h.username) = ? OR LOWER(c.current_slug) = ?
+              ORDER BY h.detected_at ASC
+            `, params: [handle, handle, handle] }
+          ], { keepOpen: true }))[0];
           if (!history.length) return null;
 
           const channelId = history[0].channel_id;
-          const channel = execAll(db, 'SELECT * FROM channels WHERE id = ?', [channelId])[0];
-          if (!channel) return null;
+          const results = await queryDbFile(dbUrl, [
+            { sql: 'SELECT * FROM channels WHERE id = ?', params: [channelId] },
+            { sql: 'SELECT slug, username, detected_at FROM username_history WHERE channel_id = ? ORDER BY detected_at ASC', params: [channelId] },
+            { sql: 'SELECT field_name, old_value, new_value, detected_at FROM socials_history WHERE channel_id = ? ORDER BY detected_at DESC', params: [channelId] },
+            { sql: 'SELECT followers_count, recorded_at FROM follower_history WHERE channel_id = ? ORDER BY recorded_at ASC', params: [channelId] },
+            { sql: 'SELECT COUNT(*) AS n FROM chat_messages WHERE sender_user_id = (SELECT COALESCE(user_id, id) FROM channels WHERE id = ?)', params: [channelId] },
+            { sql: `
+              SELECT m.message_id, m.chat_id, m.content, m.message_type, m.created_at, m.saved_at, m.raw_payload,
+                     m.sender_slug, m.sender_username,
+                     c.current_slug AS channel_slug
+              FROM chat_messages m
+              LEFT JOIN channels c ON c.id = m.chat_id
+              WHERE m.sender_user_id = (SELECT COALESCE(user_id, id) FROM channels WHERE id = ?)
+              ORDER BY COALESCE(m.created_at, m.saved_at) DESC
+              LIMIT 500
+            `, params: [channelId] }
+          ], { keepOpen: true });
 
-          const usernames = execAll(db, `
-            SELECT slug, username, detected_at FROM username_history
-            WHERE channel_id = ? ORDER BY detected_at ASC
-          `, [channelId]);
-          const socials = execAll(db, `
-            SELECT field_name, old_value, new_value, detected_at FROM socials_history
-            WHERE channel_id = ? ORDER BY detected_at DESC
-          `, [channelId]);
-          const followers = execAll(db, `
-            SELECT followers_count, recorded_at FROM follower_history
-            WHERE channel_id = ? ORDER BY recorded_at ASC
-          `, [channelId]);
-          const senderId = channel.user_id || channelId;
-          const messages = execAll(db, `
-            SELECT m.message_id, m.chat_id, m.content, m.message_type, m.created_at, m.saved_at, m.raw_payload,
-                   m.sender_slug, m.sender_username,
-                   c.current_slug AS channel_slug
-            FROM chat_messages m
-            LEFT JOIN channels c ON c.id = m.chat_id
-            WHERE m.sender_user_id = ?
-            ORDER BY COALESCE(m.created_at, m.saved_at) DESC
-            LIMIT 500
-          `, [senderId]);
-          const total = Number(execAll(db, 'SELECT COUNT(*) AS n FROM chat_messages WHERE sender_user_id = ?', [senderId])[0]?.n) || 0;
+          const channel = results[0][0];
+          if (!channel) return null;
+          const usernames = results[1];
+          const socials = results[2];
+          const followers = results[3];
+          const total = Number(results[4][0] && results[4][0].n) || 0;
+          const messages = results[5];
           messages.sort((a, b) => chatTimestampMs(b) - chatTimestampMs(a));
 
           return {
@@ -654,42 +784,36 @@
         let staticChannelSlugIndex = null;
         async function getStaticChannelSlugIndex() {
           if (!staticChannelSlugIndex) {
-            const db = await loadStaticDb();
-            staticChannelSlugIndex = new Map(
-              execAll(db, 'SELECT id, current_slug FROM channels').map(row => [String(row.id), row.current_slug])
-            );
+            const rows = (await queryDbFile(staticAssetUrl('kick_tracker.db'), [
+              { sql: 'SELECT id, current_slug FROM channels' }
+            ], { keepOpen: true }))[0];
+            staticChannelSlugIndex = new Map(rows.map(row => [String(row.id), row.current_slug]));
           }
           return staticChannelSlugIndex;
         }
 
         // Download one archive shard (archive/kick_tracker-NNN.db) and return
-        // this user's messages from it. Returns null when there is no such
-        // shard file (404 = all shards consumed), [] when the shard holds
-        // nothing for this user.
+        // this user's messages from it. Throws on transient failures (network
+        // hiccup, 5xx, timeout) so the caller can offer a retry; returns null
+        // ONLY when the shard file does not exist (404 = archive exhausted),
+        // and [] when the shard holds nothing for this user.
         async function fetchStaticChatFromShard(shardNumber) {
           const name = `kick_tracker-${String(shardNumber).padStart(3, '0')}.db`;
-          let db;
-          try {
-            // One-shot: shards are only queried once per click, and keeping
-            // each 60-90 MB WASM image cached would pile up browser memory.
-            db = await loadSqliteFromUrl(staticAssetUrl(`archive/${name}`), { cache: false });
-          } catch (error) {
-            return null;
-          }
-          try {
-            if (!currentStaticSenderUserId) return [];
-            const rows = execAll(db, `
+          if (!currentStaticSenderUserId) return [];
+          // One-shot: shards are only queried once per click, and keeping each
+          // 60-90 MB WASM image cached would pile up browser memory. close=true
+          // frees the database right after the rows are extracted.
+          const rows = (await queryDbFile(staticAssetUrl(`archive/${name}`), [
+            { sql: `
               SELECT chat_id, content, message_type, created_at, saved_at, raw_payload,
                      sender_slug, sender_username
               FROM chat_messages
               WHERE sender_user_id = ?
-            `, [currentStaticSenderUserId]);
-            const slugs = await getStaticChannelSlugIndex();
-            rows.forEach(row => { row.channel_slug = slugs.get(String(row.chat_id)) || null; });
-            return rows;
-          } finally {
-            try { db.close(); } catch { /* already released */ }
-          }
+            `, params: [currentStaticSenderUserId] }
+          ], { keepOpen: false, close: true }))[0];
+          const slugs = await getStaticChannelSlugIndex();
+          rows.forEach(row => { row.channel_slug = slugs.get(String(row.chat_id)) || null; });
+          return rows;
         }
 
         function staticChatRowKey(row) {
@@ -1114,9 +1238,19 @@
         const key = String(row.chat_id);
         if (!streams.has(key)) streams.set(key, row.channel_slug || `channel ${row.chat_id}`);
       });
-      select.innerHTML = '<option value="all">All streamers</option>' + [...streams.entries()]
-        .map(([key, name]) => `<option value="${key}">@${String(name).replace(/^@/, '')}</option>`)
-        .join('');
+      // Built with createElement/innerText: option labels come from the
+      // database, so building them via innerHTML would be an XSS vector.
+      select.textContent = '';
+      const allOption = document.createElement('option');
+      allOption.value = 'all';
+      allOption.innerText = 'All streamers';
+      select.appendChild(allOption);
+      streams.forEach((name, key) => {
+        const option = document.createElement('option');
+        option.value = key;
+        option.innerText = '@' + String(name).replace(/^@/, '');
+        select.appendChild(option);
+      });
       if (previous && [...select.options].some(option => option.value === previous)) select.value = previous;
     }
 
@@ -1204,6 +1338,10 @@
     // click to pull this user's older history into the pool. Every merge
     // re-sorts the pool newest-first, so shard order on disk doesn't matter.
     async function loadMoreChat() {
+      // Token snapshot: if the user searches for another profile while this
+      // download is in flight, its result must be discarded, not merged into
+      // the new profile's chat pool.
+      const token = activeSearchToken;
       chatVisibleCount += 20;
       renderChatHistory();
       if (dataSource !== 'static' || apiAvailable || staticChatShardExhausted || staticChatLoadingMore) return;
@@ -1215,6 +1353,7 @@
       moreButton.innerText = 'Loading older chat…';
       try {
         const rows = await fetchStaticChatFromShard(staticChatNextShard);
+        if (token !== activeSearchToken) return;
         if (rows === null) {
           staticChatShardExhausted = true;
         } else {
@@ -1222,12 +1361,21 @@
           mergeStaticChatRows(rows);
         }
       } catch (error) {
-        staticChatShardExhausted = true;
+        // 404 = the archive is genuinely exhausted; anything else (network
+        // hiccup, timeout, 5xx, ad-blocker) is transient, so leave the button
+        // available to retry instead of locking the user out of history.
+        if (/HTTP_404\b/.test(String(error && error.message))) {
+          if (token === activeSearchToken) staticChatShardExhausted = true;
+        } else if (token === activeSearchToken) {
+          showToast('Could not download older chat. Please try again.');
+        }
       } finally {
         staticChatLoadingMore = false;
-        moreButton.disabled = false;
-        moreButton.innerText = originalLabel || 'Load more chat';
-        renderChatHistory();
+        if (token === activeSearchToken) {
+          moreButton.disabled = false;
+          moreButton.innerText = originalLabel || 'Load more chat';
+          renderChatHistory();
+        }
       }
     }
 
@@ -1299,6 +1447,10 @@
       const queryHandle = (explicitQuery || inputEl.value).trim().toLowerCase();
       if (!queryHandle || !apiReady) return;
 
+      // Invalidate any in-flight search/load-more: a slower older query must
+      // never overwrite the UI with the wrong user's data.
+      const token = ++activeSearchToken;
+
       if (pushHistory) {
         window.history.pushState({}, '', `?user=${encodeURIComponent(queryHandle)}`);
       }
@@ -1306,6 +1458,7 @@
       try {
         // One fast server-side API call when available; static DB otherwise.
         const channel = await fetchProfile(queryHandle);
+        if (token !== activeSearchToken) return;
         if (!channel || !channel.id) {
           statusEl.innerText = `No records found for handle: "${queryHandle}"`;
           showToast('No records found for that handle.');
@@ -1511,6 +1664,7 @@
         chatVisibleCount = 20;
         staticChatNextShard = 1;
         staticChatShardExhausted = false;
+        staticChatLoadingMore = false;
         currentStaticSenderUserId = dataSource === 'static' ? (Number(channel.user_id || channel.id) || null) : null;
         populateChatStreamFilter();
         renderChatHistory();
@@ -1519,6 +1673,7 @@
         renderFollowerHistoryChart(getFollowerRowsForRange());
 
       } catch (err) {
+        if (token !== activeSearchToken) return;
         statusEl.innerText = `Search Error: ${err.message}`;
         showToast('Could not load this profile.');
       }
