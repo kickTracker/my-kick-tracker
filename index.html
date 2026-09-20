@@ -425,6 +425,15 @@
     let usernameVisibleCount = 10;
     let socialVisibleCount = 10;
     let chatVisibleCount = 20;
+    // Static-mode chat paging: each "Load more" click downloads ONE archive
+    // shard DB (archive/kick_tracker-NNN.db) and merges this user's rows from
+    // it into the timeline. A shard's number does not tell you whether its
+    // messages are newer or older than another shard's, so every merge
+    // re-sorts the combined pool by date (newest first).
+    let staticChatNextShard = 1;
+    let staticChatShardExhausted = false;
+    let staticChatLoadingMore = false;
+    let currentStaticSenderUserId = null;
 
     function consentIsCurrent() {
       try {
@@ -494,25 +503,46 @@
         // itself is served statically, e.g. window.KICK_API_BASE = 'https://api.example.com'.
         const API_BASE = (typeof window !== 'undefined' && window.KICK_API_BASE) ? window.KICK_API_BASE : '';
 
-        let sqlDbPromise = null;
-        function loadStaticDb() {
-          if (!sqlDbPromise) {
-            sqlDbPromise = new Promise((resolve, reject) => {
+        const SQLJS_BASE = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3';
+        let sqlJsPromise = null;
+        const sqliteDbCache = new Map();
+
+        function loadSqlJs() {
+          if (!sqlJsPromise) {
+            sqlJsPromise = new Promise((resolve, reject) => {
               const script = document.createElement('script');
-              script.src = 'https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/sql-wasm.js';
-              script.onerror = () => reject(new Error('sql.js could not load.'));
+              script.src = `${SQLJS_BASE}/sql-wasm.js`;
+              script.onerror = () => { sqlJsPromise = null; reject(new Error('sql.js could not load.')); };
               script.onload = async () => {
                 try {
-                  const SQL = await initSqlJs({ locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}` });
-                  const response = await fetch('./kick_tracker.db', { cache: 'no-store' });
-                  if (!response.ok) throw new Error('Database unavailable.');
-                  resolve(new SQL.Database(new Uint8Array(await response.arrayBuffer())));
-                } catch (error) { reject(error); }
+                  resolve(await initSqlJs({ locateFile: file => `${SQLJS_BASE}/${file}` }));
+                } catch (error) { sqlJsPromise = null; reject(error); }
               };
               document.head.appendChild(script);
             });
           }
-          return sqlDbPromise;
+          return sqlJsPromise;
+        }
+
+        // One sql.js handle per source file, cached so repeated "Load more"
+        // clicks never re-download a shard that was already fetched.
+        async function loadSqliteFromUrl(url) {
+          if (!sqliteDbCache.has(url)) {
+            const promise = (async () => {
+              const SQL = await loadSqlJs();
+              const response = await fetch(url, { cache: 'no-store' });
+              if (!response.ok) throw new Error('Database unavailable.');
+              return new SQL.Database(new Uint8Array(await response.arrayBuffer()));
+            })();
+            // A failed download must not poison the cache forever.
+            promise.catch(() => sqliteDbCache.delete(url));
+            sqliteDbCache.set(url, promise);
+          }
+          return sqliteDbCache.get(url);
+        }
+
+        function loadStaticDb() {
+          return loadSqliteFromUrl(`${API_BASE}/kick_tracker.db`);
         }
 
         function execAll(db, sql, params = []) {
@@ -580,7 +610,7 @@
           `, [channelId]);
           const senderId = channel.user_id || channelId;
           const messages = execAll(db, `
-            SELECT m.chat_id, m.content, m.message_type, m.created_at, m.saved_at, m.raw_payload,
+            SELECT m.message_id, m.chat_id, m.content, m.message_type, m.created_at, m.saved_at, m.raw_payload,
                    m.sender_slug, m.sender_username,
                    c.current_slug AS channel_slug
             FROM chat_messages m
@@ -601,6 +631,63 @@
             chat_messages_total: total,
             chat_messages_archived: 0
           };
+        }
+
+        // --- Static-mode chat paging -------------------------------------
+        // Archive shards contain ONLY chat_messages, so their rows get their
+        // channel_slug from the main database's channels table (by chat_id).
+        let staticChannelSlugIndex = null;
+        async function getStaticChannelSlugIndex() {
+          if (!staticChannelSlugIndex) {
+            const db = await loadStaticDb();
+            staticChannelSlugIndex = new Map(
+              execAll(db, 'SELECT id, current_slug FROM channels').map(row => [String(row.id), row.current_slug])
+            );
+          }
+          return staticChannelSlugIndex;
+        }
+
+        // Download one archive shard (archive/kick_tracker-NNN.db) and return
+        // this user's messages from it. Returns null when there is no such
+        // shard file (404 = all shards consumed), [] when the shard holds
+        // nothing for this user.
+        async function fetchStaticChatFromShard(shardNumber) {
+          const name = `kick_tracker-${String(shardNumber).padStart(3, '0')}.db`;
+          let db;
+          try {
+            db = await loadSqliteFromUrl(`${API_BASE}/archive/${name}`);
+          } catch (error) {
+            return null;
+          }
+          if (!currentStaticSenderUserId) return [];
+          const rows = execAll(db, `
+            SELECT chat_id, content, message_type, created_at, saved_at, raw_payload,
+                   sender_slug, sender_username
+            FROM chat_messages
+            WHERE sender_user_id = ?
+          `, [currentStaticSenderUserId]);
+          const slugs = await getStaticChannelSlugIndex();
+          rows.forEach(row => { row.channel_slug = slugs.get(String(row.chat_id)) || null; });
+          return rows;
+        }
+
+        function staticChatRowKey(row) {
+          return String(row.message_id || `${row.chat_id}|${row.created_at || ''}|${row.saved_at || ''}|${row.content || ''}`);
+        }
+
+        // Merge freshly downloaded shard rows into the displayed pool. Shard
+        // numbering says nothing about where its messages sit on the timeline,
+        // so the combined pool is always re-sorted newest first before render.
+        function mergeStaticChatRows(newRows) {
+          if (!newRows || !newRows.length) return;
+          const byKey = new Map(currentChatRows.map(row => [staticChatRowKey(row), row]));
+          newRows.forEach(row => {
+            const key = staticChatRowKey(row);
+            if (!byKey.has(key)) byKey.set(key, row);
+          });
+          currentChatRows = [...byKey.values()].sort((a, b) => chatTimestampMs(b) - chatTimestampMs(a));
+          populateChatStreamFilter();
+          renderChatHistory();
         }
 
         async function fetchProfile(handle) {
@@ -1086,7 +1173,41 @@
         }
         chatTimeline.appendChild(item);
       });
-      moreButton.classList.toggle('hidden', chatVisibleCount >= filteredRows.length);
+      const canShowMore = chatVisibleCount < filteredRows.length
+        || (!apiAvailable && !staticChatShardExhausted);
+      moreButton.classList.toggle('hidden', !canShowMore);
+    }
+
+    // "Load more" for the chat log: page through the already-loaded rows, and
+    // in static (GitHub Pages) mode also download ONE more archive shard per
+    // click to pull this user's older history into the pool. Every merge
+    // re-sorts the pool newest-first, so shard order on disk doesn't matter.
+    async function loadMoreChat() {
+      chatVisibleCount += 20;
+      renderChatHistory();
+      if (dataSource !== 'static' || apiAvailable || staticChatShardExhausted || staticChatLoadingMore) return;
+
+      staticChatLoadingMore = true;
+      const moreButton = document.getElementById('chatMoreBtn');
+      moreButton.disabled = true;
+      const originalLabel = moreButton.innerText;
+      moreButton.innerText = 'Loading older chat…';
+      try {
+        const rows = await fetchStaticChatFromShard(staticChatNextShard);
+        if (rows === null) {
+          staticChatShardExhausted = true;
+        } else {
+          staticChatNextShard += 1;
+          mergeStaticChatRows(rows);
+        }
+      } catch (error) {
+        staticChatShardExhausted = true;
+      } finally {
+        staticChatLoadingMore = false;
+        moreButton.disabled = false;
+        moreButton.innerText = originalLabel || 'Load more chat';
+        renderChatHistory();
+      }
     }
 
     function appendChatContent(container, message) {
@@ -1367,6 +1488,9 @@
 
         currentChatRows = channel.chat_messages || [];
         chatVisibleCount = 20;
+        staticChatNextShard = 1;
+        staticChatShardExhausted = false;
+        currentStaticSenderUserId = dataSource === 'static' ? (Number(channel.user_id || channel.id) || null) : null;
         populateChatStreamFilter();
         renderChatHistory();
 
@@ -1395,8 +1519,7 @@
         renderSocialHistory();
       });
       document.getElementById('chatMoreBtn').addEventListener('click', () => {
-        chatVisibleCount += 20;
-        renderChatHistory();
+        loadMoreChat();
       });
       document.getElementById('chatStreamFilter').addEventListener('change', () => {
         chatVisibleCount = 20;
