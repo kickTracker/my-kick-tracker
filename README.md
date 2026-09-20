@@ -64,7 +64,10 @@ Maintenance now keeps the file far below the limit **without throwing history aw
 2. deletes chat messages past the retention window (skipped entirely when retention is unlimited),
 3. **archives** the oldest chat messages into `archive/kick_tracker-NNN.db` shard files instead of
    deleting them - each shard rolls over at ~90 MiB, so the archive can grow essentially forever
-   while every committed file stays under GitHub's 100 MiB push limit,
+   while every committed file stays under GitHub's 100 MiB push limit. Fragmented shards are
+   merged back together in numbered order (until the next one would push the merged file over
+   ~90 MiB) on every maintenance run and via `npm run merge-shards`; a shard is only removed
+   after 100% of its rows are verified present in the merge target,
 4. enforces the hard size cap by deleting the oldest messages **only as a fallback** if archiving
    itself failed, then VACUUMs.
 

@@ -1119,6 +1119,98 @@ async function archiveOldestMessages(maxBytes) {
   return archived;
 }
 
+// Consolidate fragmented archive shards into as few files as possible:
+// shards fill in order until the next one would push the target over
+// ARCHIVE_SHARD_MAX_BYTES, then a new target starts. A source shard file is
+// deleted ONLY after every one of its rows is verified present in the target,
+// so a failure mid-merge can never lose chat history.
+async function mergeArchiveShards() {
+  fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+  const shards = fs.readdirSync(ARCHIVE_DIR)
+    .map(name => ({ name, match: /^kick_tracker-(\d+)\.db$/.exec(name) }))
+    .filter(entry => entry.match)
+    .map(entry => {
+      let bytes = 0;
+      try { bytes = fs.statSync(`${ARCHIVE_DIR}/${entry.name}`).size; } catch { bytes = 0; }
+      return { name: entry.name, num: Number(entry.match[1]), bytes };
+    })
+    .sort((a, b) => a.num - b.num);
+
+  if (shards.length <= 1) return { mergedMessages: 0, removedShards: 0 };
+
+  let mergedMessages = 0;
+  let removedShards = 0;
+  let target = shards[0];
+  let targetBytes = target.bytes;
+
+  for (const source of shards.slice(1)) {
+    if (source.bytes === 0) {
+      // Empty shard file: nothing to move, nothing to lose.
+      try { fs.rmSync(`${ARCHIVE_DIR}/${source.name}`); removedShards += 1; } catch { /* leave it */ }
+      continue;
+    }
+    if (targetBytes + source.bytes > ARCHIVE_SHARD_MAX_BYTES) {
+      // Would overflow the target: start a new consolidation target here.
+      target = source;
+      targetBytes = source.bytes;
+      continue;
+    }
+
+    const targetPath = `${ARCHIVE_DIR}/${target.name}`.replace(/'/g, "''");
+    const sourcePath = `${ARCHIVE_DIR}/${source.name}`.replace(/'/g, "''");
+    try {
+      await runQuery(`ATTACH DATABASE '${targetPath}' AS shard_merge_target`);
+      try {
+        await runQuery(`ATTACH DATABASE '${sourcePath}' AS shard_merge_source`);
+        try {
+          const sourceCount = Number((await getQuery('SELECT COUNT(*) AS total FROM shard_merge_source.chat_messages'))?.total) || 0;
+          await runQuery('BEGIN');
+          try {
+            await runQuery(`
+              INSERT OR IGNORE INTO shard_merge_target.chat_messages
+                (message_id, chat_id, sender_user_id, sender_slug, sender_username,
+                 content, message_type, created_at, raw_payload, saved_at)
+              SELECT message_id, chat_id, sender_user_id, sender_slug, sender_username,
+                     content, message_type, created_at, raw_payload, saved_at
+              FROM shard_merge_source.chat_messages
+            `);
+            await runQuery('COMMIT');
+          } catch (error) {
+            try { await runQuery('ROLLBACK'); } catch { /* no open transaction */ }
+            throw error;
+          }
+          const present = Number((await getQuery(`
+            SELECT COUNT(*) AS total FROM shard_merge_source.chat_messages s
+            WHERE EXISTS (SELECT 1 FROM shard_merge_target.chat_messages t WHERE t.message_id = s.message_id)
+          `))?.total) || 0;
+          if (present !== sourceCount) {
+            throw new Error(`copy verification failed (${present}/${sourceCount} rows)`);
+          }
+          mergedMessages += sourceCount;
+          removedShards += 1;
+        } finally {
+          try { await runQuery(`DETACH DATABASE shard_merge_source`); } catch { /* already detached */ }
+        }
+      } finally {
+        try { await runQuery(`DETACH DATABASE shard_merge_target`); } catch { /* already detached */ }
+      }
+      try { fs.rmSync(`${ARCHIVE_DIR}/${source.name}`); } catch { /* cleaned up next run */ }
+      targetBytes = fs.statSync(`${ARCHIVE_DIR}/${target.name}`).size;
+    } catch (error) {
+      console.warn(`[DB] shard merge skipped for ${source.name} -> ${target.name}: ${error.message}`);
+      target = source;
+      targetBytes = source.bytes;
+    }
+  }
+
+  if (mergedMessages > 0 || removedShards > 0) {
+    console.log(`[DB] merged shards: ${mergedMessages} message(s) re-homed, ${removedShards} shard file(s) removed`);
+    const state = readMaintenanceState();
+    writeMaintenanceState({ ...state, archiveShard: target.name });
+  }
+  return { mergedMessages, removedShards };
+}
+
 async function runChatStorageMaintenance({ force = false, quiet = false } = {}) {
   const startedAt = Date.now();
   const before = getDatabaseSizeBytes();
@@ -1152,6 +1244,14 @@ async function runChatStorageMaintenance({ force = false, quiet = false } = {}) 
     if (getDatabaseSizeBytes() > CHAT_MAX_DB_BYTES) {
       capped = await enforceChatSizeCap(CHAT_MAX_DB_BYTES);
     }
+  }
+
+  // Consolidate fragmented shards: existing shard files are topped up in order
+  // before any new file is minted. Cheap no-op once everything is consolidated.
+  try {
+    await mergeArchiveShards();
+  } catch (error) {
+    console.warn('[DB] shard merge failed:', error.message);
   }
 
   const after = getDatabaseSizeBytes();
@@ -1192,6 +1292,15 @@ async function main() {
     // the tracked database is back under the size cap. Never deletes messages.
     const result = await runChatStorageMaintenance({ force: true });
     console.log(`[DB] archive pass done: ${result.archived} message(s) moved to shards; kick_tracker.db is ${formatMiB(result.after)}`);
+    db.close();
+    return;
+  }
+
+  if (process.argv[2] === '--merge-shards') {
+    // One-off/manual: consolidate fragmented archive shards into as few files
+    // as possible (fills shards to ARCHIVE_SHARD_MAX_BYTES in numbered order).
+    const result = await mergeArchiveShards();
+    console.log(`[DB] shard merge done: ${result.mergedMessages} message(s) re-homed, ${result.removedShards} shard file(s) removed`);
     db.close();
     return;
   }

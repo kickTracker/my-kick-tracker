@@ -10,6 +10,7 @@
     "refresh-all": "node tracker.js --refresh-all",
     "prune": "node tracker.js --prune",
     "archive": "node tracker.js --archive",
+    "merge-shards": "node tracker.js --merge-shards",
     "monitor": "node tracker.js --monitor",
     "serve": "node server.js",
     "gen-icons": "node generate-icons.js",
