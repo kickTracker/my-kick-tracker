@@ -525,8 +525,16 @@
         }
 
         // One sql.js handle per source file, cached so repeated "Load more"
-        // clicks never re-download a shard that was already fetched.
-        async function loadSqliteFromUrl(url) {
+        // clicks never re-download a shard that was already fetched. Pass
+        // { cache: false } for one-shot sources (shards) so their multi-MB
+        // WASM images can be released right after the rows are extracted.
+        async function loadSqliteFromUrl(url, { cache = true } = {}) {
+          if (!cache) {
+            const SQL = await loadSqlJs();
+            const response = await fetch(url, { cache: 'no-store' });
+            if (!response.ok) throw new Error('Database unavailable.');
+            return new SQL.Database(new Uint8Array(await response.arrayBuffer()));
+          }
           if (!sqliteDbCache.has(url)) {
             const promise = (async () => {
               const SQL = await loadSqlJs();
@@ -662,20 +670,26 @@
           const name = `kick_tracker-${String(shardNumber).padStart(3, '0')}.db`;
           let db;
           try {
-            db = await loadSqliteFromUrl(staticAssetUrl(`archive/${name}`));
+            // One-shot: shards are only queried once per click, and keeping
+            // each 60-90 MB WASM image cached would pile up browser memory.
+            db = await loadSqliteFromUrl(staticAssetUrl(`archive/${name}`), { cache: false });
           } catch (error) {
             return null;
           }
-          if (!currentStaticSenderUserId) return [];
-          const rows = execAll(db, `
-            SELECT chat_id, content, message_type, created_at, saved_at, raw_payload,
-                   sender_slug, sender_username
-            FROM chat_messages
-            WHERE sender_user_id = ?
-          `, [currentStaticSenderUserId]);
-          const slugs = await getStaticChannelSlugIndex();
-          rows.forEach(row => { row.channel_slug = slugs.get(String(row.chat_id)) || null; });
-          return rows;
+          try {
+            if (!currentStaticSenderUserId) return [];
+            const rows = execAll(db, `
+              SELECT chat_id, content, message_type, created_at, saved_at, raw_payload,
+                     sender_slug, sender_username
+              FROM chat_messages
+              WHERE sender_user_id = ?
+            `, [currentStaticSenderUserId]);
+            const slugs = await getStaticChannelSlugIndex();
+            rows.forEach(row => { row.channel_slug = slugs.get(String(row.chat_id)) || null; });
+            return rows;
+          } finally {
+            try { db.close(); } catch { /* already released */ }
+          }
         }
 
         function staticChatRowKey(row) {
