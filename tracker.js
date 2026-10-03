@@ -570,11 +570,27 @@ async function saveChatHistory(chatId, historyPayload) {
 }
 
 async function refreshChatUserChannel(sender, senderId) {
+  const normalisedSlug = String(sender?.slug || '').trim();
+  const normalisedUsername = String(sender?.username || normalisedSlug || '').trim();
   const existingChannel = await getQuery(`
-    SELECT id, current_slug, current_username FROM channels
-    WHERE user_id = ? OR LOWER(current_slug) = LOWER(?)
+    SELECT c.id, c.current_slug, c.current_username
+    FROM channels c
+    WHERE c.user_id = ?
+       OR LOWER(c.current_slug) = LOWER(?)
+       OR LOWER(c.current_username) = LOWER(?)
+       OR EXISTS (
+         SELECT 1 FROM username_history h
+         WHERE h.channel_id = c.id
+           AND (LOWER(h.slug) = LOWER(?) OR LOWER(h.username) = LOWER(?))
+       )
     LIMIT 1
-  `, [senderId, sender.slug || '']);
+  `, [
+    senderId,
+    normalisedSlug,
+    normalisedUsername,
+    normalisedSlug,
+    normalisedUsername,
+  ]);
   if (!sender.slug) return Boolean(existingChannel);
 
   try {

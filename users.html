@@ -26,6 +26,17 @@
     .intro { color: var(--muted); margin: 0 0 24px; }
     .toolbar { display: flex; gap: 10px; align-items: center; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 8px; }
     .toolbar input { flex: 1; min-width: 0; border: 0; outline: 0; background: transparent; color: var(--text); padding: 12px; font-size: 1rem; }
+    .toolbar-row { display: flex; align-items: center; gap: 10px; }
+    .toggle-advanced { border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--text); border-radius: 10px; font-weight: 700; padding: 10px 12px; cursor: pointer; }
+    .advanced-panel { margin-top: 10px; background: var(--panel); border: 1px solid var(--border); border-radius: 14px; padding: 14px; display: grid; gap: 12px; }
+    .advanced-panel.hidden { display: none; }
+    .advanced-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+    .field { display: grid; gap: 6px; }
+    .field label { color: var(--muted); font-size: 0.8rem; }
+    .field input[type="number"] { width: 100%; border: 1px solid var(--border); background: rgba(255,255,255,0.02); color: var(--text); border-radius: 9px; padding: 10px 12px; }
+    .check-row { display: flex; align-items: center; gap: 8px; color: var(--text); font-size: 0.9rem; }
+    .check-row input { accent-color: var(--green); }
+    .advanced-hint { color: var(--muted); font-size: 0.78rem; }
     .count { color: var(--muted); font-size: 0.82rem; margin: 14px 2px; }
     .list { display: grid; gap: 8px; }
     .user { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 14px; align-items: center; padding: 14px 16px; background: rgba(255,255,255,0.025); border: 1px solid var(--border); border-radius: 11px; }
@@ -61,7 +72,24 @@
     <nav class="nav"><a class="brand" href="./"><span class="logo">K</span> KickIntel</a><a class="back" href="./">Back to tracker</a></nav>
     <h1>Tracked Users</h1>
     <p class="intro">Every channel and chatter profile saved in the database, newest additions first.</p>
-    <div class="toolbar"><input id="search" type="search" placeholder="Search users by username or tag..." autocomplete="off" /></div>
+    <div class="toolbar-row">
+      <div class="toolbar" style="flex:1;"><input id="search" type="search" placeholder="Search users by username or tag..." autocomplete="off" /></div>
+      <button id="toggleAdvanced" class="toggle-advanced" type="button" aria-expanded="false">Advanced search</button>
+    </div>
+    <div id="advancedPanel" class="advanced-panel hidden" aria-live="polite">
+      <div class="advanced-grid">
+        <div class="field">
+          <label for="minFollowers">Min followers</label>
+          <input id="minFollowers" type="number" min="0" step="1" placeholder="0" />
+        </div>
+        <div class="field">
+          <label for="maxFollowers">Max followers</label>
+          <input id="maxFollowers" type="number" min="0" step="1" placeholder="Any" />
+        </div>
+      </div>
+      <label class="check-row"><input id="filterHistory" type="checkbox" /> <span>Only show users with a previous username in history</span></label>
+      <div id="advancedHint" class="advanced-hint">History-based filters work when the browser can read the local database.</div>
+    </div>
     <div id="status" class="status">Loading users...</div>
     <div id="count" class="count"></div>
     <div id="list" class="list"></div>
@@ -102,6 +130,44 @@
     const API_BASE = (typeof window !== 'undefined' && window.KICK_API_BASE) ? window.KICK_API_BASE : '';
     const STATIC_DB_URL = API_BASE ? `${API_BASE.replace(/\/+$/, '')}/kick_tracker.db` : './kick_tracker.db';
 
+    function getActiveFilters() {
+      const minFollowers = document.getElementById('minFollowers');
+      const maxFollowers = document.getElementById('maxFollowers');
+      const flagHistory = document.getElementById('filterHistory');
+      const min = minFollowers.value.trim();
+      const max = maxFollowers.value.trim();
+
+      return {
+        minFollowers: min !== '' ? Number(min) : null,
+        maxFollowers: max !== '' ? Number(max) : null,
+        onlyHistory: !!flagHistory.checked
+      };
+    }
+
+    function userHasHistory(user) {
+      if (typeof user?.has_username_history === 'boolean') return user.has_username_history;
+      const count = Number(user?.username_history_count ?? 0);
+      return count > 0;
+    }
+
+    function matchesAdvancedFilters(user, filters) {
+      const followers = Number(user.followers_count || user.followers || 0);
+      if (filters.minFollowers !== null && followers < filters.minFollowers) return false;
+      if (filters.maxFollowers !== null && followers > filters.maxFollowers) return false;
+      if (filters.onlyHistory && !userHasHistory(user)) return false;
+      return true;
+    }
+
+    function matchesSearchTerm(user, term) {
+      if (!term) return true;
+      const username = (user.current_username || user.username || '').toLowerCase();
+      const slug = (user.current_slug || user.slug || '').toLowerCase();
+      return username.startsWith(term)
+        || slug.startsWith(term)
+        || username.includes(term)
+        || slug.includes(term);
+    }
+
     let sqlDbPromise = null;
 
     function staticSiteMessage() {
@@ -121,11 +187,15 @@
           current_slug: row.slug,
           current_username: row.username,
           followers_count: row.followers,
-          last_updated: row.last_updated
+          last_updated: row.last_updated,
+          has_username_history: false,
+          username_history_count: 0
         }));
         users = defaultUsers.slice();
         totalUsers = payload.total || users.length;
         status.innerText = '';
+        document.getElementById('filterHistory').disabled = true;
+        document.getElementById('advancedHint').innerText = 'History-based filters are only available when the page is reading the local database directly.';
         renderUsers();
       } catch (error) {
         status.innerText = error && error.message ? error.message : staticSiteMessage();
@@ -145,10 +215,7 @@
       if (apiMode) {
         const searchTerm = query.toLowerCase();
         users = defaultUsers.filter(user => {
-          const username = (user.current_username || '').toLowerCase();
-          const slug = (user.current_slug || '').toLowerCase();
-          return username.startsWith(searchTerm) || slug.startsWith(searchTerm)
-            || username.includes(searchTerm) || slug.includes(searchTerm);
+          return matchesSearchTerm(user, searchTerm);
         });
         totalUsers = Math.max(totalUsers, defaultUsers.length);
         status.innerText = users.length ? 'Search is limited to the current recent user list in API mode.' : 'No matches in the loaded recent list.';
@@ -160,10 +227,7 @@
         const allUsers = await loadAllUsersFromDb();
         const searchTerm = query.toLowerCase();
         users = allUsers.filter(user => {
-          const username = (user.current_username || '').toLowerCase();
-          const slug = (user.current_slug || '').toLowerCase();
-          return username.startsWith(searchTerm) || slug.startsWith(searchTerm)
-            || username.includes(searchTerm) || slug.includes(searchTerm);
+          return matchesSearchTerm(user, searchTerm);
         });
         totalUsers = allUsers.length;
         status.innerText = '';
@@ -241,7 +305,8 @@
       const db = await loadStaticDb();
       const total = Number(execAll(db, 'SELECT COUNT(*) AS n FROM channels')[0]?.n) || 0;
       const rows = execAll(db, `
-        SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated
+        SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated,
+               (SELECT COUNT(*) FROM username_history h WHERE h.channel_id = c.id) AS username_history_count
         FROM channels c
         ORDER BY (SELECT MIN(h.id) FROM username_history h WHERE h.channel_id = c.id) DESC, c.id DESC
         LIMIT 100
@@ -254,7 +319,9 @@
           slug: row.current_slug,
           username: row.current_username,
           followers: row.followers_count,
-          last_updated: row.last_updated
+          last_updated: row.last_updated,
+          has_username_history: Number(row.username_history_count || 0) > 0,
+          username_history_count: Number(row.username_history_count || 0)
         }))
       };
     }
@@ -263,7 +330,8 @@
       if (fullSearchIndex.length) return fullSearchIndex;
       const db = await loadStaticDb();
       const rows = execAll(db, `
-        SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated
+        SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated,
+               (SELECT COUNT(*) FROM username_history h WHERE h.channel_id = c.id) AS username_history_count
         FROM channels c
         ORDER BY c.current_username COLLATE NOCASE ASC, c.id ASC
       `);
@@ -272,21 +340,18 @@
         current_slug: row.current_slug,
         current_username: row.current_username,
         followers_count: row.followers_count,
-        last_updated: row.last_updated
+        last_updated: row.last_updated,
+        has_username_history: Number(row.username_history_count || 0) > 0,
+        username_history_count: Number(row.username_history_count || 0)
       }));
       return fullSearchIndex.slice();
     }
 
     function renderUsers() {
       const query = document.getElementById('search').value.trim();
-      const listUsers = query ? users : defaultUsers;
-      const matches = listUsers.filter(user => {
-        if (!query) return true;
-        const username = (user.current_username || '').toLowerCase();
-        const slug = (user.current_slug || '').toLowerCase();
-        const term = query.toLowerCase();
-        return username.startsWith(term) || slug.startsWith(term) || username.includes(term) || slug.includes(term);
-      });
+      const sourceList = query ? users : defaultUsers;
+      const filters = getActiveFilters();
+      const matches = sourceList.filter(user => matchesSearchTerm(user, query.toLowerCase()) && matchesAdvancedFilters(user, filters));
 
       if (query) {
         if (apiMode) {
@@ -315,10 +380,23 @@
         const meta = document.createElement('div');
         meta.className = 'user-meta';
         meta.innerText = `Channel ID: ${user.id} · Last update: ${formatLocalDate(user.last_updated)}`;
+        if (userHasHistory(user)) {
+          const historyTag = document.createElement('span');
+          historyTag.style.display = 'inline-block';
+          historyTag.style.marginLeft = '8px';
+          historyTag.style.padding = '3px 6px';
+          historyTag.style.borderRadius = '999px';
+          historyTag.style.background = 'rgba(83,252,24,0.12)';
+          historyTag.style.color = 'var(--green)';
+          historyTag.style.fontSize = '0.7rem';
+          historyTag.style.fontWeight = '700';
+          historyTag.innerText = 'renamed';
+          meta.appendChild(historyTag);
+        }
         info.append(link, meta);
         const followers = document.createElement('div');
         followers.className = 'user-followers';
-        followers.innerText = `${Number(user.followers_count || 0).toLocaleString()} followers`;
+        followers.innerText = `${Number(user.followers_count || user.followers || 0).toLocaleString()} followers`;
         row.append(info, followers);
         list.appendChild(row);
       });
@@ -342,6 +420,24 @@
       }
       await searchAllUsers(value);
     });
+
+    document.getElementById('toggleAdvanced').addEventListener('click', () => {
+      const panel = document.getElementById('advancedPanel');
+      const button = document.getElementById('toggleAdvanced');
+      const isHidden = panel.classList.toggle('hidden');
+      button.setAttribute('aria-expanded', String(!isHidden));
+      button.innerText = isHidden ? 'Advanced search' : 'Hide filters';
+    });
+
+    ['minFollowers', 'maxFollowers', 'filterHistory'].forEach((id) => {
+      document.getElementById(id).addEventListener('input', () => {
+        renderUsers();
+      });
+      document.getElementById(id).addEventListener('change', () => {
+        renderUsers();
+      });
+    });
+
     start();
   </script>
 </body>
