@@ -70,8 +70,11 @@
     const TERMS_VERSION = '2026-09-12.2';
     const PRIVACY_VERSION = '2026-09-12.3';
     const CONSENT_KEY = 'kickintel-consent';
+    let defaultUsers = [];
     let users = [];
     let totalUsers = 0;
+    let fullSearchIndex = [];
+    let apiMode = false;
 
     function hasConsent() {
       try {
@@ -97,24 +100,77 @@
     }
 
     const API_BASE = (typeof window !== 'undefined' && window.KICK_API_BASE) ? window.KICK_API_BASE : '';
+    const STATIC_DB_URL = API_BASE ? `${API_BASE.replace(/\/+$/, '')}/kick_tracker.db` : './kick_tracker.db';
 
     let sqlDbPromise = null;
+
+    function staticSiteMessage() {
+      const hostSummary = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+        ? 'This local page is running without a server-backed API.'
+        : 'This page is being served as a static site (for example GitHub Pages).';
+      return `${hostSummary} It needs either a live API at KICK_API_BASE or a committed kick_tracker.db file at the site root.`;
+    }
 
     async function loadUsers() {
       const status = document.getElementById('status');
       try {
         const payload = await fetchLatestUsers();
-        users = (payload.users || []).map(row => ({
+        apiMode = payload?.source === 'api';
+        defaultUsers = (payload.users || []).map(row => ({
           id: row.id,
           current_slug: row.slug,
           current_username: row.username,
           followers_count: row.followers,
           last_updated: row.last_updated
         }));
+        users = defaultUsers.slice();
         totalUsers = payload.total || users.length;
         status.innerText = '';
         renderUsers();
-      } catch (error) { status.innerText = error.message; }
+      } catch (error) {
+        status.innerText = error && error.message ? error.message : staticSiteMessage();
+      }
+    }
+
+    async function searchAllUsers(query) {
+      const status = document.getElementById('status');
+      if (!query) {
+        users = defaultUsers.slice();
+        totalUsers = Math.max(totalUsers, defaultUsers.length);
+        status.innerText = '';
+        renderUsers();
+        return;
+      }
+
+      if (apiMode) {
+        const searchTerm = query.toLowerCase();
+        users = defaultUsers.filter(user => {
+          const username = (user.current_username || '').toLowerCase();
+          const slug = (user.current_slug || '').toLowerCase();
+          return username.startsWith(searchTerm) || slug.startsWith(searchTerm)
+            || username.includes(searchTerm) || slug.includes(searchTerm);
+        });
+        totalUsers = Math.max(totalUsers, defaultUsers.length);
+        status.innerText = users.length ? 'Search is limited to the current recent user list in API mode.' : 'No matches in the loaded recent list.';
+        renderUsers();
+        return;
+      }
+
+      try {
+        const allUsers = await loadAllUsersFromDb();
+        const searchTerm = query.toLowerCase();
+        users = allUsers.filter(user => {
+          const username = (user.current_username || '').toLowerCase();
+          const slug = (user.current_slug || '').toLowerCase();
+          return username.startsWith(searchTerm) || slug.startsWith(searchTerm)
+            || username.includes(searchTerm) || slug.includes(searchTerm);
+        });
+        totalUsers = allUsers.length;
+        status.innerText = '';
+        renderUsers();
+      } catch (error) {
+        status.innerText = error && error.message ? error.message : staticSiteMessage();
+      }
     }
 
     // Preferred: the /v1/api endpoint (fast, token-gated, rate limited).
@@ -132,6 +188,7 @@
         if (response.ok) {
           const payload = await response.json();
           return {
+            source: 'api',
             total: payload.total || 0,
             users: (payload.users || []).map(row => ({
               id: row.id,
@@ -157,10 +214,14 @@
           script.onload = async () => {
             try {
               const SQL = await initSqlJs({ locateFile: file => `https://cdnjs.cloudflare.com/ajax/libs/sql.js/1.10.3/${file}` });
-              const response = await fetch('./kick_tracker.db', { cache: 'no-store' });
-              if (!response.ok) throw new Error('Database unavailable.');
+              const response = await fetch(STATIC_DB_URL, { cache: 'no-store' });
+              if (!response.ok) {
+                throw new Error(staticSiteMessage());
+              }
               resolve(new SQL.Database(new Uint8Array(await response.arrayBuffer())));
-            } catch (error) { reject(error); }
+            } catch (error) {
+              reject(new Error(error && error.message ? error.message : staticSiteMessage()));
+            }
           };
           document.head.appendChild(script);
         });
@@ -186,6 +247,7 @@
         LIMIT 100
       `);
       return {
+        source: 'static',
         total,
         users: rows.map(row => ({
           id: row.id,
@@ -197,17 +259,52 @@
       };
     }
 
-    const MAX_USERS_SHOWN = 100;
+    async function loadAllUsersFromDb() {
+      if (fullSearchIndex.length) return fullSearchIndex;
+      const db = await loadStaticDb();
+      const rows = execAll(db, `
+        SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated
+        FROM channels c
+        ORDER BY c.current_username COLLATE NOCASE ASC, c.id ASC
+      `);
+      fullSearchIndex = rows.map(row => ({
+        id: row.id,
+        current_slug: row.current_slug,
+        current_username: row.current_username,
+        followers_count: row.followers_count,
+        last_updated: row.last_updated
+      }));
+      return fullSearchIndex.slice();
+    }
+
     function renderUsers() {
-      const query = document.getElementById('search').value.trim().toLowerCase();
-      const matches = users.filter(user => `${user.current_username || ''} ${user.current_slug || ''}`.toLowerCase().includes(query));
-      document.getElementById('count').innerText = matches.length === users.length
-        ? `${matches.length.toLocaleString()} of ${totalUsers.toLocaleString()} users`
-        : `${matches.length.toLocaleString()} matching of ${totalUsers.toLocaleString()} users (page shows the ${users.length.toLocaleString()} newest)`;
+      const query = document.getElementById('search').value.trim();
+      const listUsers = query ? users : defaultUsers;
+      const matches = listUsers.filter(user => {
+        if (!query) return true;
+        const username = (user.current_username || '').toLowerCase();
+        const slug = (user.current_slug || '').toLowerCase();
+        const term = query.toLowerCase();
+        return username.startsWith(term) || slug.startsWith(term) || username.includes(term) || slug.includes(term);
+      });
+
+      if (query) {
+        if (apiMode) {
+          document.getElementById('count').innerText = `${matches.length.toLocaleString()} matching in the recent list`;
+        } else {
+          document.getElementById('count').innerText = `${matches.length.toLocaleString()} matching users in the database`;
+        }
+      } else {
+        document.getElementById('count').innerText = `${matches.length.toLocaleString()} of ${totalUsers.toLocaleString()} users`;
+      }
+
       const list = document.getElementById('list');
       list.innerHTML = '';
-      if (!matches.length) { list.innerHTML = '<div class="empty">No users match your search.</div>'; return; }
-      matches.slice(0, MAX_USERS_SHOWN).forEach(user => {
+      if (!matches.length) {
+        list.innerHTML = '<div class="empty">No users match your search.</div>';
+        return;
+      }
+      matches.forEach(user => {
         const row = document.createElement('div');
         row.className = 'user';
         const info = document.createElement('div');
@@ -235,7 +332,16 @@
       return new Intl.DateTimeFormat(undefined, { dateStyle: 'medium', timeStyle: 'short' }).format(date);
     }
 
-    document.getElementById('search').addEventListener('input', renderUsers);
+    document.getElementById('search').addEventListener('input', async (event) => {
+      const value = event.target.value.trim();
+      if (!value) {
+        users = defaultUsers.slice();
+        totalUsers = Math.max(totalUsers, defaultUsers.length);
+        renderUsers();
+        return;
+      }
+      await searchAllUsers(value);
+    });
     start();
   </script>
 </body>
