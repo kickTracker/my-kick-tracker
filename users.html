@@ -188,14 +188,16 @@
           current_username: row.username,
           followers_count: row.followers,
           last_updated: row.last_updated,
-          has_username_history: false,
-          username_history_count: 0
+          has_username_history: row.has_username_history ?? Number(row.username_history_count || 0) > 0,
+          username_history_count: Number(row.username_history_count || 0)
         }));
         users = defaultUsers.slice();
         totalUsers = payload.total || users.length;
         status.innerText = '';
-        document.getElementById('filterHistory').disabled = true;
-        document.getElementById('advancedHint').innerText = 'History-based filters are only available when the page is reading the local database directly.';
+        document.getElementById('filterHistory').disabled = apiMode;
+        document.getElementById('advancedHint').innerText = apiMode
+          ? 'Username history is not included in API results. Filters in API mode only apply to the recent user list.'
+          : 'Filters search the full local database, including username history.';
         renderUsers();
       } catch (error) {
         status.innerText = error && error.message ? error.message : staticSiteMessage();
@@ -204,7 +206,21 @@
 
     async function searchAllUsers(query) {
       const status = document.getElementById('status');
-      if (!query) {
+      const filters = getActiveFilters();
+      const hasAdvancedFilters = filters.minFollowers !== null
+        || filters.maxFollowers !== null
+        || filters.onlyHistory;
+      if (apiMode) {
+        users = defaultUsers.slice();
+        totalUsers = Math.max(totalUsers, defaultUsers.length);
+        status.innerText = query || hasAdvancedFilters
+          ? 'Search and filters are limited to the current recent user list in API mode.'
+          : '';
+        renderUsers();
+        return;
+      }
+
+      if (!query && !hasAdvancedFilters) {
         users = defaultUsers.slice();
         totalUsers = Math.max(totalUsers, defaultUsers.length);
         status.innerText = '';
@@ -212,24 +228,9 @@
         return;
       }
 
-      if (apiMode) {
-        const searchTerm = query.toLowerCase();
-        users = defaultUsers.filter(user => {
-          return matchesSearchTerm(user, searchTerm);
-        });
-        totalUsers = Math.max(totalUsers, defaultUsers.length);
-        status.innerText = users.length ? 'Search is limited to the current recent user list in API mode.' : 'No matches in the loaded recent list.';
-        renderUsers();
-        return;
-      }
-
       try {
-        const allUsers = await loadAllUsersFromDb();
-        const searchTerm = query.toLowerCase();
-        users = allUsers.filter(user => {
-          return matchesSearchTerm(user, searchTerm);
-        });
-        totalUsers = allUsers.length;
+        users = await loadAllUsersFromDb();
+        totalUsers = users.length;
         status.innerText = '';
         renderUsers();
       } catch (error) {
@@ -349,8 +350,11 @@
 
     function renderUsers() {
       const query = document.getElementById('search').value.trim();
-      const sourceList = query ? users : defaultUsers;
       const filters = getActiveFilters();
+      const hasAdvancedFilters = filters.minFollowers !== null
+        || filters.maxFollowers !== null
+        || filters.onlyHistory;
+      const sourceList = query || hasAdvancedFilters ? users : defaultUsers;
       const matches = sourceList.filter(user => matchesSearchTerm(user, query.toLowerCase()) && matchesAdvancedFilters(user, filters));
 
       if (query) {
@@ -412,12 +416,6 @@
 
     document.getElementById('search').addEventListener('input', async (event) => {
       const value = event.target.value.trim();
-      if (!value) {
-        users = defaultUsers.slice();
-        totalUsers = Math.max(totalUsers, defaultUsers.length);
-        renderUsers();
-        return;
-      }
       await searchAllUsers(value);
     });
 
@@ -430,12 +428,9 @@
     });
 
     ['minFollowers', 'maxFollowers', 'filterHistory'].forEach((id) => {
-      document.getElementById(id).addEventListener('input', () => {
-        renderUsers();
-      });
-      document.getElementById(id).addEventListener('change', () => {
-        renderUsers();
-      });
+      const refresh = () => searchAllUsers(document.getElementById('search').value.trim());
+      document.getElementById(id).addEventListener('input', refresh);
+      document.getElementById(id).addEventListener('change', refresh);
     });
 
     start();
