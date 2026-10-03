@@ -146,6 +146,7 @@
 
     function userHasHistory(user) {
       if (typeof user?.has_username_history === 'boolean') return user.has_username_history;
+      if (user?.has_username_history !== undefined) return Number(user.has_username_history) > 0;
       const count = Number(user?.username_history_count ?? 0);
       return count > 0;
     }
@@ -188,8 +189,7 @@
           current_username: row.username,
           followers_count: row.followers,
           last_updated: row.last_updated,
-          has_username_history: row.has_username_history ?? Number(row.username_history_count || 0) > 0,
-          username_history_count: Number(row.username_history_count || 0)
+          has_username_history: Number(row.has_username_history || 0) > 0
         }));
         users = defaultUsers.slice();
         totalUsers = payload.total || users.length;
@@ -229,11 +229,17 @@
       }
 
       try {
+        if (!fullSearchIndex.length) {
+          status.innerText = `Loading all ${totalUsers.toLocaleString()} users...`;
+          await new Promise(resolve => requestAnimationFrame(resolve));
+        }
         users = await loadAllUsersFromDb();
         totalUsers = users.length;
         status.innerText = '';
         renderUsers();
       } catch (error) {
+        users = [];
+        renderUsers();
         status.innerText = error && error.message ? error.message : staticSiteMessage();
       }
     }
@@ -307,7 +313,12 @@
       const total = Number(execAll(db, 'SELECT COUNT(*) AS n FROM channels')[0]?.n) || 0;
       const rows = execAll(db, `
         SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated,
-               (SELECT COUNT(*) FROM username_history h WHERE h.channel_id = c.id) AS username_history_count
+               EXISTS (
+                 SELECT 1 FROM username_history h
+                 WHERE h.channel_id = c.id
+                   AND TRIM(COALESCE(h.slug, '')) <> ''
+                   AND LOWER(TRIM(h.slug)) <> LOWER(TRIM(COALESCE(c.current_slug, '')))
+               ) AS has_username_history
         FROM channels c
         ORDER BY (SELECT MIN(h.id) FROM username_history h WHERE h.channel_id = c.id) DESC, c.id DESC
         LIMIT 100
@@ -321,8 +332,7 @@
           username: row.current_username,
           followers: row.followers_count,
           last_updated: row.last_updated,
-          has_username_history: Number(row.username_history_count || 0) > 0,
-          username_history_count: Number(row.username_history_count || 0)
+          has_username_history: Number(row.has_username_history || 0) > 0
         }))
       };
     }
@@ -332,7 +342,12 @@
       const db = await loadStaticDb();
       const rows = execAll(db, `
         SELECT c.id, c.current_slug, c.current_username, c.followers_count, c.last_updated,
-               (SELECT COUNT(*) FROM username_history h WHERE h.channel_id = c.id) AS username_history_count
+               EXISTS (
+                 SELECT 1 FROM username_history h
+                 WHERE h.channel_id = c.id
+                   AND TRIM(COALESCE(h.slug, '')) <> ''
+                   AND LOWER(TRIM(h.slug)) <> LOWER(TRIM(COALESCE(c.current_slug, '')))
+               ) AS has_username_history
         FROM channels c
         ORDER BY c.current_username COLLATE NOCASE ASC, c.id ASC
       `);
@@ -342,8 +357,7 @@
         current_username: row.current_username,
         followers_count: row.followers_count,
         last_updated: row.last_updated,
-        has_username_history: Number(row.username_history_count || 0) > 0,
-        username_history_count: Number(row.username_history_count || 0)
+        has_username_history: Number(row.has_username_history || 0) > 0
       }));
       return fullSearchIndex.slice();
     }
@@ -427,10 +441,13 @@
       button.innerText = isHidden ? 'Advanced search' : 'Hide filters';
     });
 
-    ['minFollowers', 'maxFollowers', 'filterHistory'].forEach((id) => {
+    ['minFollowers', 'maxFollowers'].forEach((id) => {
       const refresh = () => searchAllUsers(document.getElementById('search').value.trim());
       document.getElementById(id).addEventListener('input', refresh);
-      document.getElementById(id).addEventListener('change', refresh);
+    });
+
+    document.getElementById('filterHistory').addEventListener('change', () => {
+      searchAllUsers(document.getElementById('search').value.trim());
     });
 
     start();
